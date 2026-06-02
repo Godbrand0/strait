@@ -1,0 +1,18 @@
+[package]
+name = "strait-join"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Join engine for cross-chain event matching and state machine"
+
+[dependencies]
+strait-core = { path = "../strait-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }

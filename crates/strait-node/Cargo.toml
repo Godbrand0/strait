@@ -1,0 +1,24 @@
+[package]
+name = "strait-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Main binary that wires all Strait components together"
+
+[[bin]]
+name = "strait-node"
+path = "src/main.rs"
+
+[dependencies]
+strait-core = { path = "../strait-core" }
+strait-bitcoin = { path = "../strait-bitcoin" }
+strait-evm = { path = "../strait-evm" }
+strait-join = { path = "../strait-join" }
+strait-store = { path = "../strait-store" }
+strait-api = { path = "../strait-api" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

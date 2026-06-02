@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/strait-core",
+    "crates/strait-bitcoin",
+    "crates/strait-evm",
+    "crates/strait-join",
+    "crates/strait-store",
+    "crates/strait-api",
+    "crates/strait-node",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/strait-data/strait"
+
+[workspace.dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+
+# EVM interaction (Hemi + Ethereum) — use alloy, NOT ethers-rs
+alloy = { version = "0.3", features = ["full"] }
+
+# Bitcoin RPC
+bitcoincore-rpc = "0.18"
+bitcoin = { version = "0.32", features = ["serde"] }
+
+# Database
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid", "bigdecimal", "chrono", "migrate"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP server (for GraphQL + webhooks)
+axum = { version = "0.7", features = ["ws"] }
+
+# GraphQL
+async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-graphql-axum = "7"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+tokio-stream = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

@@ -1,0 +1,727 @@
+# Strait — Hemi Tunnel Indexer: Implementation Prompt for Claude Code
+
+## Your Role
+
+You are a senior Rust engineer with 10+ years of systems programming experience. You have deep expertise in:
+- Async Rust with Tokio — you write `async/await` code that is correct under load, handles cancellation, and does not leak tasks
+- The `alloy` crate ecosystem for EVM interaction (not ethers-rs, which is deprecated)
+- `bitcoincore-rpc` and Bitcoin data structures
+- `sqlx` with Postgres for async database access
+- Domain-driven design in Rust — strong types, newtype patterns, no stringly-typed interfaces
+- Reorg-safe blockchain indexing — you treat chain reorganizations as normal control flow, not edge cases
+- Production-grade error handling with `thiserror` and `anyhow` — you never `.unwrap()` in library code
+
+You do not write placeholder code. You do not write `todo!()` unless explicitly told to defer something. Every function you write compiles, handles its error cases, and does what it says it does. You write code as if it will go to production.
+
+---
+
+## What You Are Building
+
+**Strait** is a real-time, reorg-safe tunnel indexer for Hemi Network. It tracks assets moving through Hemi's trust-minimized bridges between three chains:
+
+- **Bitcoin** → **Hemi** (BTC tunneled into Hemi as hBTC)
+- **Hemi** → **Bitcoin** (hBTC withdrawn back to native BTC)
+- **Ethereum** → **Hemi** (ETH/ERC-20 tunneled into Hemi)
+- **Hemi** → **Ethereum** (tunneled assets withdrawn to Ethereum)
+
+The core problem: each tunnel transfer produces events on multiple chains simultaneously, with different finality semantics and no shared identifier in raw form. Strait's job is to ingest all three chains, join related events into a single `TunnelTransfer` record with a complete lifecycle, and serve that data via GraphQL and webhooks.
+
+The critical path is the **join engine** — a state machine that takes raw events from three asynchronous ingestion streams and produces unified, reorg-safe `TunnelTransfer` records.
+
+**Hemi specifics you need to know:**
+- Hemi is an EVM-compatible chain (chain ID: 43111 for mainnet, 743111 for testnet)
+- Hemi RPC: `https://rpc.hemi.network/rpc` (mainnet), `https://testnet.rpc.hemi.network/rpc` (testnet)
+- Hemi uses Proof-of-Publication (PoP) miners who publish commitments to Bitcoin, anchoring Hemi's finality to Bitcoin
+- Tunnel contracts live on Hemi and have corresponding contracts on Ethereum
+- Bitcoin tunnel deposits go to a custody address watched by Hemi validators; the deposit triggers a Hemi mint
+- All Hemi EVM interactions use standard EVM logs — same as Ethereum, use `alloy`
+
+---
+
+## Tech Stack — Non-Negotiable
+
+```toml
+# Core async runtime
+tokio = { version = "1", features = ["full"] }
+
+# EVM interaction (Hemi + Ethereum) — use alloy, NOT ethers-rs
+alloy = { version = "0.3", features = ["full"] }
+
+# Bitcoin RPC
+bitcoincore-rpc = "0.18"
+bitcoin = "0.32"
+
+# Database
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid", "bigdecimal", "chrono", "migrate"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP server (for GraphQL + webhooks)
+axum = { version = "0.7", features = ["ws"] }
+
+# GraphQL
+async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-graphql-axum = "7"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bigdecimal = { version = "0.4", features = ["serde"] }
+tokio-stream = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+```
+
+Use a **Cargo workspace** with separate crates. Do not put everything in one crate.
+
+---
+
+## Project Structure
+
+Build this workspace layout from the start. Every crate has a clear responsibility and clear boundaries.
+
+```
+strait/
+├── Cargo.toml                  # workspace root
+├── .env.example
+├── migrations/                 # sqlx migrations
+│   └── 001_initial.sql
+├── crates/
+│   ├── strait-core/            # domain types, shared traits, errors
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── types.rs        # TunnelTransfer, ChainTransaction, etc.
+│   │       ├── events.rs       # raw ingestion events (pre-join)
+│   │       ├── error.rs        # StraitError with thiserror
+│   │       └── config.rs       # AppConfig loaded from env/file
+│   │
+│   ├── strait-bitcoin/         # Bitcoin chain ingester
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── ingester.rs     # BitcoinIngester struct + run loop
+│   │       ├── watcher.rs      # tunnel address + OP_RETURN watcher
+│   │       └── reorg.rs        # reorg detection and retraction logic
+│   │
+│   ├── strait-evm/             # shared EVM ingester (used by Hemi + Ethereum)
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── ingester.rs     # EvmIngester<ChainId> generic ingester
+│   │       ├── contracts.rs    # tunnel contract ABIs and log decoders
+│   │       └── reorg.rs        # EVM reorg handling
+│   │
+│   ├── strait-join/            # the join engine — core of the system
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── engine.rs       # JoinEngine — consumes events, produces TunnelTransfers
+│   │       ├── state.rs        # per-transfer state machine
+│   │       └── matcher.rs      # cross-chain event matching logic
+│   │
+│   ├── strait-store/           # database layer
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── db.rs           # PgPool setup, migration runner
+│   │       ├── transfers.rs    # TunnelTransfer CRUD
+│   │       └── events.rs       # raw event storage for replay
+│   │
+│   ├── strait-api/             # GraphQL + webhook HTTP server
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── server.rs       # axum router + startup
+│   │       ├── graphql/
+│   │       │   ├── mod.rs
+│   │       │   ├── schema.rs   # async-graphql schema
+│   │       │   └── resolvers.rs
+│   │       └── webhooks/
+│   │           ├── mod.rs
+│   │           ├── dispatcher.rs  # webhook fan-out with retry
+│   │           └── registry.rs    # webhook subscription management
+│   │
+│   └── strait-node/            # binary — wires everything together
+│       └── src/
+│           └── main.rs
+```
+
+---
+
+## Domain Types — Start Here
+
+Before any ingester or API code, define the domain types in `strait-core`. These types are the contract every other crate depends on. Get them right first.
+
+### `crates/strait-core/src/types.rs`
+
+Define these types with full serde derives, strong newtypes for IDs, and no `String` where a specific type belongs:
+
+```rust
+// Newtype wrappers — never use raw strings for chain-specific identifiers
+pub struct TxHash(pub [u8; 32]);      // EVM tx hash
+pub struct BitcoinTxid(pub [u8; 32]); // Bitcoin txid (little-endian stored)
+pub struct BlockHash(pub [u8; 32]);
+pub struct Address(pub [u8; 20]);     // EVM address
+pub struct BitcoinAddress(pub String); // bech32 / legacy — keep as String
+
+// The central domain object
+pub struct TunnelTransfer {
+    pub id: Uuid,
+    pub asset: Asset,
+    pub direction: TunnelDirection,
+    pub route: TunnelRoute,
+    pub amount: BigDecimal,
+    pub sender: ChainAddress,
+    pub recipient: ChainAddress,
+    pub status: TunnelStatus,
+    pub initiated_at: DateTime<Utc>,
+    pub finalized_at: Option<DateTime<Utc>>,
+    pub source_tx: ChainTransaction,
+    pub destination_tx: Option<ChainTransaction>,
+    pub pop_proofs: Vec<PopProof>,
+    pub reorg_events: Vec<ReorgEvent>,
+}
+
+pub enum TunnelStatus {
+    Initiated,
+    Anchored,   // PoP proof observed for BTC routes; relay observed for ETH routes
+    Finalized,
+    Failed { reason: String },
+    Reorged { retracted_at: DateTime<Utc> },
+}
+
+pub enum TunnelDirection { In, Out }
+
+pub enum TunnelRoute {
+    BtcToHemi,
+    HemiToBtc,
+    EthToHemi,
+    HemiToEth,
+}
+
+pub enum Asset {
+    Btc,
+    Eth,
+    Erc20 { contract: Address, symbol: String, decimals: u8 },
+}
+
+pub enum ChainAddress {
+    Evm(Address),
+    Bitcoin(BitcoinAddress),
+}
+
+pub struct ChainTransaction {
+    pub chain: Chain,
+    pub hash: ChainTxHash,
+    pub block_number: u64,
+    pub block_hash: BlockHash,
+    pub timestamp: DateTime<Utc>,
+    pub confirmations: u32,
+}
+
+pub enum Chain { Bitcoin, Hemi, Ethereum }
+
+pub struct PopProof {
+    pub bitcoin_txid: BitcoinTxid,
+    pub bitcoin_block: u64,
+    pub hemi_block_range: (u64, u64),
+    pub observed_at: DateTime<Utc>,
+}
+
+pub struct ReorgEvent {
+    pub chain: Chain,
+    pub depth: u32,
+    pub old_tip: BlockHash,
+    pub new_tip: BlockHash,
+    pub affected_from_block: u64,
+    pub detected_at: DateTime<Utc>,
+}
+```
+
+Implement `Display`, `Debug`, `PartialEq`, `Eq`, `Hash` for all newtypes. Implement `From<[u8;32]>` and `TryFrom<&str>` for hash types. These are foundational — do them properly.
+
+### `crates/strait-core/src/events.rs`
+
+Raw events are what ingesters emit before the join engine processes them. Separate them cleanly from domain types:
+
+```rust
+pub enum RawEvent {
+    Bitcoin(BitcoinEvent),
+    Hemi(HemiEvent),
+    Ethereum(EthereumEvent),
+}
+
+pub enum BitcoinEvent {
+    TunnelDeposit {
+        txid: BitcoinTxid,
+        vout: u32,
+        to_address: BitcoinAddress,
+        amount_sats: u64,
+        op_return_data: Option<Vec<u8>>,
+        block_number: u64,
+        block_hash: BlockHash,
+        block_time: DateTime<Utc>,
+    },
+    TunnelWithdrawal {
+        txid: BitcoinTxid,
+        from_address: BitcoinAddress,
+        to_address: BitcoinAddress,
+        amount_sats: u64,
+        block_number: u64,
+        block_hash: BlockHash,
+        block_time: DateTime<Utc>,
+    },
+    BlockReorg {
+        old_tip: BlockHash,
+        new_tip: BlockHash,
+        depth: u32,
+        affected_from_block: u64,
+    },
+}
+
+pub enum HemiEvent {
+    TunnelMint {
+        tx_hash: TxHash,
+        asset: Asset,
+        amount: BigDecimal,
+        to: Address,
+        source_txid: Option<BitcoinTxid>,  // present for BTC routes
+        block_number: u64,
+        log_index: u32,
+    },
+    TunnelBurn {
+        tx_hash: TxHash,
+        asset: Asset,
+        amount: BigDecimal,
+        from: Address,
+        destination: ChainAddress,
+        block_number: u64,
+        log_index: u32,
+    },
+    PopProofSubmitted {
+        tx_hash: TxHash,
+        bitcoin_txid: BitcoinTxid,
+        hemi_block_range: (u64, u64),
+        block_number: u64,
+    },
+    BlockReorg {
+        old_tip: BlockHash,
+        new_tip: BlockHash,
+        depth: u32,
+        affected_from_block: u64,
+    },
+}
+
+pub enum EthereumEvent {
+    TunnelLock {
+        tx_hash: TxHash,
+        asset: Asset,
+        amount: BigDecimal,
+        from: Address,
+        block_number: u64,
+        log_index: u32,
+    },
+    TunnelRelease {
+        tx_hash: TxHash,
+        asset: Asset,
+        amount: BigDecimal,
+        to: Address,
+        block_number: u64,
+        log_index: u32,
+    },
+    BlockReorg {
+        old_tip: BlockHash,
+        new_tip: BlockHash,
+        depth: u32,
+        affected_from_block: u64,
+    },
+}
+```
+
+---
+
+## Configuration
+
+Define a strongly-typed config struct in `strait-core/src/config.rs`. Load from environment variables using the `config` crate with `.env` fallback via `dotenvy`. Every field has a sensible default where applicable.
+
+```rust
+pub struct AppConfig {
+    pub bitcoin: BitcoinConfig,
+    pub hemi: EvmChainConfig,
+    pub ethereum: EvmChainConfig,
+    pub database: DatabaseConfig,
+    pub api: ApiConfig,
+}
+
+pub struct BitcoinConfig {
+    pub rpc_url: String,
+    pub rpc_user: String,
+    pub rpc_password: String,
+    pub tunnel_addresses: Vec<String>,   // addresses to watch for deposits
+    pub confirmation_depth: u32,         // default: 6
+    pub poll_interval_secs: u64,         // default: 10
+}
+
+pub struct EvmChainConfig {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub tunnel_contract: String,         // checksummed address
+    pub start_block: u64,                // block to begin indexing from
+    pub confirmation_depth: u32,         // default: 12 for ETH, 3 for Hemi
+    pub poll_interval_ms: u64,
+}
+
+pub struct DatabaseConfig {
+    pub url: String,                     // postgres connection string
+    pub max_connections: u32,            // default: 10
+}
+
+pub struct ApiConfig {
+    pub host: String,                    // default: 0.0.0.0
+    pub port: u16,                       // default: 8080
+}
+```
+
+---
+
+## Implementation Order — Follow This Exactly
+
+### Step 1: Workspace and `strait-core`
+
+- Create the Cargo workspace with all crates declared
+- Implement all types in `strait-core` fully — no stubs
+- Write unit tests for type conversions (TxHash from hex string, Address from bytes, etc.)
+- Write the config loader and validate it reads from environment variables correctly
+
+**Done when:** `cargo test -p strait-core` passes with tests for every type conversion.
+
+### Step 2: Database Schema and `strait-store`
+
+Write the initial migration in `migrations/001_initial.sql`. The schema must represent the full `TunnelTransfer` lifecycle including reorg events. Key tables:
+
+- `tunnel_transfers` — one row per transfer, status updated in place, `updated_at` always set
+- `chain_transactions` — source and destination tx records referenced by transfer ID
+- `pop_proofs` — PoP submissions linked to transfer IDs
+- `reorg_events` — full audit log of every reorg, never deleted
+- `raw_events` — append-only log of every ingested raw event for replay capability
+- `webhook_subscriptions` — registered webhooks with filter config
+
+Use `sqlx::migrate!()` macro in `strait-store/src/db.rs` to run migrations on startup. Implement typed query functions in `strait-store/src/transfers.rs` using `sqlx::query_as!()` macros — never raw string queries. Every function is `async` and returns `Result<_, sqlx::Error>`.
+
+**Done when:** `sqlx migrate run` succeeds and `cargo test -p strait-store` passes with integration tests against a real Postgres instance (use `docker-compose` with a Postgres container).
+
+### Step 3: Hemi EVM Ingester
+
+Start with the Hemi ingester (not Bitcoin) because it's the closest to a standard EVM chain and lets you validate the event pipeline before touching Bitcoin complexity.
+
+In `strait-evm/src/ingester.rs`, implement `EvmIngester`:
+
+```rust
+pub struct EvmIngester {
+    provider: Arc<RootProvider<Http<Client>>>,   // alloy provider
+    chain: Chain,
+    config: EvmChainConfig,
+    tunnel_contract: Address,
+    event_tx: mpsc::Sender<RawEvent>,           // sends to join engine
+}
+
+impl EvmIngester {
+    pub async fn new(config: EvmChainConfig, chain: Chain, event_tx: mpsc::Sender<RawEvent>) -> Result<Self>;
+    pub async fn run(self) -> Result<()>;        // main poll loop, runs forever
+    async fn poll_new_blocks(&mut self, from: u64, to: u64) -> Result<()>;
+    async fn process_logs(&self, logs: Vec<Log>) -> Result<Vec<RawEvent>>;
+    async fn detect_reorg(&mut self, block: &Block) -> Option<ReorgEvent>;
+}
+```
+
+Reorg detection: keep a rolling window of the last `confirmation_depth * 2` block hashes. On every new block, check that its `parent_hash` matches the hash you have stored for `block_number - 1`. If it doesn't, you have a reorg — walk backward to find the fork point, emit a `BlockReorg` event, and re-index from there.
+
+Define the tunnel contract ABI in `strait-evm/src/contracts.rs` using alloy's `sol!()` macro. You need at minimum:
+- `TunnelMint(address indexed to, address indexed asset, uint256 amount, bytes32 sourceTxid)`
+- `TunnelBurn(address indexed from, address indexed asset, uint256 amount, bytes destinationAddr)`
+
+You will need to look up the actual Hemi tunnel contract addresses and ABI from Hemi's documentation or deployed contracts. Use `https://explorer.hemi.xyz` to find the tunnel contracts. Stub the addresses with config values and document exactly where to find them.
+
+**Done when:** The Hemi ingester runs against Hemi testnet, prints structured logs for every tunnel event it observes, and correctly detects and emits reorg events when they occur. Validate with `tracing` output.
+
+### Step 4: Ethereum EVM Ingester
+
+Identical structure to Step 3, using `strait-evm`'s generic `EvmIngester` with `Chain::Ethereum` and Ethereum mainnet config. The tunnel contract on the Ethereum side handles the lock/release events.
+
+**Done when:** Ethereum ingester runs in parallel with Hemi ingester using `tokio::join!()` in a test harness, both emitting events to the same channel.
+
+### Step 5: Bitcoin Ingester
+
+More complex than the EVM ingesters. Implement `BitcoinIngester` in `strait-bitcoin/src/ingester.rs`:
+
+```rust
+pub struct BitcoinIngester {
+    client: bitcoincore_rpc::Client,
+    watched_addresses: HashSet<BitcoinAddress>,
+    config: BitcoinConfig,
+    event_tx: mpsc::Sender<RawEvent>,
+    tip_tracker: TipTracker,               // rolling window of recent block hashes
+}
+```
+
+The poll loop:
+1. Call `getblockcount` to get current height
+2. For each new block up to `current_height - confirmation_depth`:
+   a. Call `getblock(hash, 2)` to get full block with transactions
+   b. Scan every output of every transaction for watched addresses
+   c. Scan `OP_RETURN` outputs for Hemi tunnel metadata (the deposit includes the Hemi destination address in OP_RETURN)
+   d. Check every transaction for inputs spending previously-seen tunnel UTXOs (this is the withdrawal signal)
+3. Run `detect_reorg()` on every block before processing it
+
+For reorg detection on Bitcoin: store a `HashMap<u64, BlockHash>` of `block_number → block_hash` for the last 30 blocks. On each poll, verify that `getblockhash(n)` still returns the hash you stored for block `n`. If not, find the fork point by walking backward and emit `BitcoinEvent::BlockReorg`.
+
+Parse OP_RETURN data: Hemi deposits include a payload in the transaction's OP_RETURN output that encodes the destination Hemi address. Implement `parse_hemi_op_return(data: &[u8]) -> Option<Address>` to extract it. The exact encoding needs to be confirmed from Hemi's Bitcoin tunnel documentation — add a clear `// TODO: confirm encoding with Hemi docs` comment and implement a reasonable placeholder.
+
+**Done when:** Bitcoin ingester connects to a Bitcoin testnet node (or a regtest instance), detects a test deposit to a watched address, parses the OP_RETURN, and emits the correct `BitcoinEvent::TunnelDeposit`.
+
+### Step 6: The Join Engine
+
+This is the most important crate. `strait-join/src/engine.rs` consumes events from all three ingesters and produces `TunnelTransfer` records.
+
+```rust
+pub struct JoinEngine {
+    event_rx: mpsc::Receiver<RawEvent>,
+    transfer_tx: mpsc::Sender<TunnelTransferUpdate>,   // to store layer
+    in_flight: HashMap<TransferKey, InFlightTransfer>,
+    reorg_window: VecDeque<ReorgCheckpoint>,
+}
+
+// The key that lets us match events across chains
+// For BTC routes: bitcoin txid of the deposit
+// For ETH routes: ethereum tx hash of the lock
+pub enum TransferKey {
+    BitcoinTxid(BitcoinTxid),
+    EthereumTxHash(TxHash),
+}
+
+pub enum TunnelTransferUpdate {
+    Created(TunnelTransfer),
+    StatusChanged { id: Uuid, new_status: TunnelStatus, updated_at: DateTime<Utc> },
+    Retracted { id: Uuid, reason: String, retracted_at: DateTime<Utc> },
+    DestinationConfirmed { id: Uuid, destination_tx: ChainTransaction },
+    PopProofAdded { id: Uuid, proof: PopProof },
+}
+```
+
+The state machine per transfer (`strait-join/src/state.rs`):
+
+```
+BitcoinEvent::TunnelDeposit observed
+    → create InFlightTransfer with status INITIATED
+    → wait for HemiEvent::TunnelMint with matching source_txid
+
+HemiEvent::TunnelMint with matching source_txid observed
+    → update status to ANCHORED
+    → wait for PopProof (optional, enhances confidence)
+
+PopProof covering the Hemi mint block observed
+    → update status to FINALIZED
+
+At any point: BitcoinEvent::BlockReorg covering the deposit block
+    → emit Retracted update
+    → remove from in_flight
+
+At any point: HemiEvent::BlockReorg covering the mint block
+    → revert to INITIATED status (mint needs to be re-observed)
+```
+
+The matcher (`strait-join/src/matcher.rs`) extracts the `TransferKey` from each event type and looks up the `InFlightTransfer`. The matching logic depends on which data the Hemi tunnel contract includes in its `TunnelMint` log — specifically the `sourceTxid` field. This is the primary join key for BTC routes.
+
+For ETH routes, matching uses the Ethereum lock tx hash embedded in the Hemi mint event.
+
+**Done when:** Unit tests in `strait-join` demonstrate the full state machine for both BTC→Hemi and ETH→Hemi routes, including reorg-triggered retraction.
+
+### Step 7: GraphQL API
+
+In `strait-api/src/graphql/schema.rs`, define the schema using `async-graphql`:
+
+```rust
+pub struct QueryRoot;
+
+#[Object]
+impl QueryRoot {
+    async fn tunnel_transfer(&self, ctx: &Context<'_>, id: Uuid) -> Result<Option<TunnelTransferGql>>;
+
+    async fn tunnel_transfers(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<TunnelTransferFilter>,
+        first: Option<i32>,
+        after: Option<String>,    // cursor pagination
+    ) -> Result<TunnelTransferConnection>;
+
+    async fn tunnel_stats(
+        &self,
+        ctx: &Context<'_>,
+        window: TimeWindow,       // LAST_24H, LAST_7D, LAST_30D, ALL_TIME
+    ) -> Result<TunnelStats>;
+}
+
+pub struct TunnelTransferFilter {
+    pub asset: Option<Asset>,
+    pub direction: Option<TunnelDirection>,
+    pub route: Option<TunnelRoute>,
+    pub status: Option<TunnelStatus>,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub amount_gte: Option<BigDecimal>,
+    pub initiated_after: Option<DateTime<Utc>>,
+    pub initiated_before: Option<DateTime<Utc>>,
+}
+
+pub struct TunnelStats {
+    pub total_volume_usd: BigDecimal,
+    pub transfer_count: i64,
+    pub average_finality_secs: f64,
+    pub active_transfers: i64,
+}
+```
+
+Mount the GraphQL handler on `/graphql` and a GraphQL playground on `/` in development mode. Use axum's `Extension` to inject the database pool into resolvers.
+
+### Step 8: Webhook Dispatcher
+
+In `strait-api/src/webhooks/dispatcher.rs`:
+
+```rust
+pub struct WebhookDispatcher {
+    subscriptions: Arc<RwLock<Vec<WebhookSubscription>>>,
+    client: reqwest::Client,
+    update_rx: mpsc::Receiver<TunnelTransferUpdate>,
+}
+
+pub struct WebhookSubscription {
+    pub id: Uuid,
+    pub url: String,
+    pub secret: String,      // HMAC-SHA256 signing key
+    pub filter: WebhookFilter,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct WebhookFilter {
+    pub routes: Option<Vec<TunnelRoute>>,
+    pub assets: Option<Vec<Asset>>,
+    pub status_transitions: Option<Vec<TunnelStatus>>,
+    pub min_amount: Option<BigDecimal>,
+    pub addresses: Option<Vec<String>>,
+}
+```
+
+Delivery: use an exponential backoff retry with a maximum of 5 attempts. Sign every delivery with `HMAC-SHA256(secret, body)` and include the signature in a `X-Strait-Signature` header. On permanent failure (5 retries exhausted), log the failure at `ERROR` level and emit a metric.
+
+### Step 9: `strait-node` — Wire Everything Together
+
+In `strait-node/src/main.rs`:
+
+```rust
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 1. Initialize tracing (JSON format in production, pretty in dev)
+    // 2. Load AppConfig
+    // 3. Run DB migrations
+    // 4. Create shared mpsc channels: raw_event_tx/rx, transfer_update_tx/rx
+    // 5. Spawn Bitcoin ingester task
+    // 6. Spawn Hemi EVM ingester task
+    // 7. Spawn Ethereum EVM ingester task
+    // 8. Spawn JoinEngine task
+    // 9. Spawn WebhookDispatcher task
+    // 10. Start axum API server (this blocks until shutdown)
+
+    // All spawned tasks use tokio::select! with a shutdown signal
+    // (tokio::signal::ctrl_c()) for clean shutdown
+}
+```
+
+Use `tokio::task::JoinSet` to manage all background tasks. If any task exits unexpectedly (not via shutdown signal), log at `ERROR` and initiate graceful shutdown of the remaining tasks.
+
+---
+
+## Quality Standards — Non-Negotiable
+
+**Error handling**: Every fallible function returns `Result`. Use `thiserror` for library errors in `strait-core`, `anyhow` for `main()` and top-level orchestration. Never `.unwrap()` in library code. Never `.expect()` unless the invariant is truly impossible to violate and the comment explains why.
+
+**Logging**: Every significant state transition emits a structured `tracing` event with relevant fields (transfer ID, chain, block number, status). Use `tracing::instrument` on ingester poll loops. Use `tracing::Span` to correlate events across tasks for a single transfer.
+
+**Testing**: Unit tests live alongside their code in `#[cfg(test)]` modules. Integration tests that require Postgres or a chain node live in `tests/` directories within each crate. The join engine has comprehensive unit tests covering every state machine transition — these do not require a database or chain connection.
+
+**No magic numbers**: Chain IDs, confirmation depths, contract addresses, and timeouts are all config values. Nothing is hardcoded in logic.
+
+**Graceful shutdown**: Every long-running task listens to a `CancellationToken` from the `tokio-util` crate (add it to dependencies). On shutdown signal, ingesters stop polling, the join engine drains its input channel, and the API server stops accepting new connections.
+
+---
+
+## Where to Start Right Now
+
+**First commit**: Set up the Cargo workspace. Create all crate `Cargo.toml` files with correct dependencies. Implement `strait-core/src/types.rs` completely. Write tests for all type conversions. Run `cargo build` and confirm zero warnings.
+
+**Second commit**: Implement `strait-core/src/config.rs` and `AppConfig`. Write `strait-store/src/db.rs` with migration runner. Write `migrations/001_initial.sql` with the full schema. Confirm `cargo sqlx migrate run` works against a local Postgres.
+
+**Third commit**: Implement `strait-evm` and get the Hemi ingester running against Hemi testnet. Print a structured log line for every event. This validates the full event pipeline before the join engine exists.
+
+From there, proceed through Steps 4–9 in order. Do not skip ahead.
+
+---
+
+## Environment Variables Required
+
+```bash
+# Bitcoin
+BITCOIN_RPC_URL=http://localhost:8332
+BITCOIN_RPC_USER=user
+BITCOIN_RPC_PASSWORD=password
+BITCOIN_TUNNEL_ADDRESSES=bc1q...,...   # comma-separated
+BITCOIN_CONFIRMATION_DEPTH=6
+
+# Hemi
+HEMI_RPC_URL=https://testnet.rpc.hemi.network/rpc
+HEMI_CHAIN_ID=743111
+HEMI_TUNNEL_CONTRACT=0x...
+HEMI_START_BLOCK=0
+HEMI_CONFIRMATION_DEPTH=3
+
+# Ethereum
+ETH_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+ETH_CHAIN_ID=11155111
+ETH_TUNNEL_CONTRACT=0x...
+ETH_START_BLOCK=0
+ETH_CONFIRMATION_DEPTH=12
+
+# Database
+DATABASE_URL=postgres://postgres:password@localhost:5432/strait
+
+# API
+API_HOST=0.0.0.0
+API_PORT=8080
+```
+
+---
+
+## Open Questions to Resolve During Build
+
+These require checking Hemi's documentation and deployed contracts before the corresponding code can be finalized. Flag them with `// FIXME: confirm with Hemi docs` in the code:
+
+1. **Hemi tunnel contract addresses** on mainnet and testnet — find at `https://explorer.hemi.xyz` or Hemi's GitHub
+2. **Exact ABI** of the Hemi tunnel contracts — specifically the event signatures for mint and burn
+3. **OP_RETURN encoding** for Bitcoin deposits — how does the Hemi tunnel encode the destination address in Bitcoin transaction OP_RETURN data
+4. **PoP proof contract** — which contract on Hemi emits PoP proof events and what is its event signature
+5. **Ethereum-side tunnel contract** — address and ABI for the Ethereum lock/release contract
+
+Do not block on these. Use placeholder addresses and document the research needed. The architecture and logic are the same regardless of the specific contract addresses.
+
+---
+
+Begin with Step 1. Write real code.
