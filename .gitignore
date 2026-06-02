@@ -1,1 +1,8 @@
 /target
+
+# Secrets
+.env
+
+# Internal docs
+prompt.txt
+files (3)/
