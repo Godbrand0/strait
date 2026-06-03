@@ -84,6 +84,11 @@ sol! {
 
         function isAddressValid(string calldata btcAddress) external view returns (bool);
 
+        /// Convert a Bitcoin address to its locking script (precompile 0x46).
+        /// Supports P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
+        /// Useful for verifying custody address scripts without local derivation.
+        function getScriptForAddress(string calldata btcAddress) external view returns (bytes memory script);
+
         function transactionExists(bytes32 txId) external view returns (bool exists);
 
         function getTransactionByTxId(bytes32 txId) external view returns (Transaction memory);

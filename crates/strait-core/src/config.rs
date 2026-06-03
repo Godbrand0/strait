@@ -85,11 +85,40 @@ pub struct ApiConfig {
 }
 
 // ============================================================================
+// Confirmed timing constants (from Hemi documentation)
+// ============================================================================
+
+/// Bitcoin tunnel: 6 confirmations required before minting on Hemi (~1 hour).
+pub const BTC_CONFIRMATION_DEPTH: u32 = 6;
+
+/// Hemi: faster finality, 3 confirmations sufficient.
+pub const HEMI_CONFIRMATION_DEPTH: u32 = 3;
+
+/// Ethereum: 12 confirmations for standard finality.
+pub const ETH_CONFIRMATION_DEPTH: u32 = 12;
+
+/// ETH→Hemi deposit: representative token mints within ~2 minutes of Ethereum lock.
+/// Used as the match window for pairing TunnelLock with TunnelMint events.
+pub const ETH_DEPOSIT_MATCH_WINDOW_SECS: i64 = 300; // 5 min — 2.5x the observed ~2 min
+
+/// Hemi→ETH withdrawal: up to ~40 minutes to achieve Bitcoin finality,
+/// plus up to 24 hours for proof submission. The join engine keeps a
+/// withdrawal in ANCHORED state for this long before marking it FAILED.
+pub const ETH_WITHDRAWAL_PROOF_WINDOW_SECS: i64 = 90_000; // 25 hours
+
+/// BTC→Hemi deposit: 6 Bitcoin confirmations at ~10 min/block = ~1 hour.
+/// Used as the match window for pairing TunnelDeposit with TunnelMint events.
+pub const BTC_DEPOSIT_MATCH_WINDOW_SECS: i64 = 7_200; // 2 hours — 2x the observed ~1 hour
+
+/// Hemi→BTC withdrawal: up to ~12 hours for custodian verification.
+pub const BTC_WITHDRAWAL_WINDOW_SECS: i64 = 50_400; // 14 hours — safety margin
+
+// ============================================================================
 // Default values
 // ============================================================================
 
 fn default_bitcoin_confirmation_depth() -> u32 {
-    6
+    BTC_CONFIRMATION_DEPTH
 }
 
 fn default_bitcoin_poll_interval() -> u64 {
@@ -101,7 +130,7 @@ fn default_start_block() -> u64 {
 }
 
 fn default_evm_confirmation_depth() -> u32 {
-    12
+    ETH_CONFIRMATION_DEPTH
 }
 
 fn default_evm_poll_interval() -> u64 {

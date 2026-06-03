@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use strait_core::{
+    config::{BTC_DEPOSIT_MATCH_WINDOW_SECS, ETH_DEPOSIT_MATCH_WINDOW_SECS},
     events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent},
     types::{BitcoinTxid, Address},
 };
@@ -17,16 +18,22 @@ use strait_core::{
 /// Configuration for matching behavior.
 #[derive(Debug, Clone)]
 pub struct MatcherConfig {
-    /// Maximum age gap between source and destination events (seconds).
-    pub max_event_gap_secs: i64,
+    /// Maximum time gap allowed between a BTC deposit and its Hemi mint (seconds).
+    /// Confirmed: Bitcoin tunnel takes ~1 hour (6 confirmations). Default: 2 hours.
+    pub btc_deposit_match_window_secs: i64,
+    /// Maximum time gap allowed between an ETH lock and its Hemi mint (seconds).
+    /// Confirmed: ETH tunnel takes ~2 minutes. Default: 5 minutes.
+    pub eth_deposit_match_window_secs: i64,
     /// Tolerance for amount matching (fraction, e.g. 0.01 = 1%).
+    /// Accounts for fees that may reduce the received amount slightly.
     pub amount_tolerance: f64,
 }
 
 impl Default for MatcherConfig {
     fn default() -> Self {
         Self {
-            max_event_gap_secs: 3600,
+            btc_deposit_match_window_secs: BTC_DEPOSIT_MATCH_WINDOW_SECS,
+            eth_deposit_match_window_secs: ETH_DEPOSIT_MATCH_WINDOW_SECS,
             amount_tolerance: 0.01,
         }
     }
@@ -132,7 +139,7 @@ impl EventMatcher {
         // Fallback: address+asset match.
         let key = MatchKey { address: address.clone(), asset: "BTC".to_string() };
         if let Some(mints) = self.pending_hemi_mints_by_addr.get_mut(&key) {
-            let gap = self.config.max_event_gap_secs;
+            let gap = self.config.btc_deposit_match_window_secs;
             if let Some(pos) = mints.iter().position(|m| {
                 amounts_match(pending.amount, m.amount, tolerance)
                     && within_time_window(pending.timestamp, m.timestamp, gap)
@@ -202,7 +209,7 @@ impl EventMatcher {
                 } else {
                     // Fallback: addr+asset match (ETH route)
                     let key = MatchKey { address: addr_str.clone(), asset: asset_str.clone() };
-                    let gap = self.config.max_event_gap_secs;
+                    let gap = self.config.eth_deposit_match_window_secs;
                     if let Some(locks) = self.pending_eth_locks.get_mut(&key) {
                         if let Some(pos) = locks.iter().position(|l| {
                             amounts_match(l.amount, amount_f64, tolerance)
@@ -274,7 +281,7 @@ impl EventMatcher {
                 let asset_str  = format!("{:?}", asset);
                 let key = MatchKey { address: addr_str.clone(), asset: asset_str.clone() };
                 let tolerance  = self.config.amount_tolerance;
-                let gap        = self.config.max_event_gap_secs;
+                let gap        = self.config.eth_deposit_match_window_secs;
 
                 let pending = PendingEvent {
                     raw: event,
