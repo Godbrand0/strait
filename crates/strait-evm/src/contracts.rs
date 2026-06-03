@@ -185,6 +185,52 @@ sol! {
 }
 
 // ============================================================================
+// PoPPayoutsV2 — PoP anchoring contract (confirmed from hemilabs/pop-payouts)
+//
+// Testnet:  0x4a3b61C586DB4CD219E85aC0697b66916c7457AB  (Hemi Sepolia)
+// Mainnet:  not yet indexed — confirm from Hemi explorer
+//
+// One keystone every 25 Hemi blocks (~5 minutes). When mintPoPRewards() is
+// called by the sequencer for keystone K, it emits PayoutRoundExecuted(K).
+// All Hemi blocks in (K-25, K] are then considered PoP-anchored on Bitcoin.
+//
+// Strait uses this to advance BTC→Hemi transfers from INITIATED → ANCHORED:
+//   anchored when PayoutRoundExecuted(blockRewarded >= ceil(mint_block/25)*25).
+// ============================================================================
+
+sol! {
+    interface IPoPPayoutsV2 {
+        /// Fired once per keystone block when mintPoPRewards() is called.
+        /// blockRewarded is always a multiple of 25 (KEYSTONE_FREQUENCY).
+        /// popScore == 0 means no miners published but the round still executed.
+        event PayoutRoundExecuted(
+            uint64 indexed blockRewarded,
+            uint256 rewardPool,
+            uint256 popScore
+        );
+
+        /// Fired when missed keystones are backfilled with zero publications.
+        event RoundsBackfilled(
+            uint64 indexed startBlock,
+            uint64 indexed endBlock,
+            uint256 count
+        );
+
+        /// The most recently rewarded keystone block.
+        /// Any Hemi block <= lastBlockRewarded is PoP-anchored.
+        function lastBlockRewarded() external view returns (uint64);
+
+        /// Query a specific payout round by index.
+        /// rounds[i].blockHeight is the keystone block for that round.
+        function rounds(uint256 index) external view returns (
+            uint64 blockHeight,
+            uint256 totalPoPScore,
+            uint256 rewardPool
+        );
+    }
+}
+
+// ============================================================================
 // BitcoinKitV1 precompile interface
 // Confirmed from Hemi mainnet explorer (verified, Solidity 0.8.26).
 // Mainnet:  0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12
@@ -444,6 +490,14 @@ pub mod topics {
     pub fn withdrawal_challenge_success() -> B256 {
         keccak256(b"WithdrawalChallengeSuccess(address,address,uint64)")
     }
+
+    // PoPPayoutsV2 events
+    pub fn payout_round_executed() -> B256 {
+        keccak256(b"PayoutRoundExecuted(uint64,uint256,uint256)")
+    }
+    pub fn rounds_backfilled() -> B256 {
+        keccak256(b"RoundsBackfilled(uint64,uint64,uint256)")
+    }
 }
 
 // ============================================================================
@@ -481,6 +535,16 @@ pub mod addresses {
     /// BitcoinKit v0 on Hemi Sepolia (testnet).
     pub const HEMI_SEPOLIA_BITCOIN_KIT_V0: Address =
         alloy::primitives::address!("eC9fa5daC1118963933e1A675a4EEA0009b7f215");
+
+    // ---- PoPPayoutsV2 ----
+    // Confirmed from Hemi Sepolia explorer + hemilabs/pop-payouts repo.
+
+    /// PoPPayoutsV2 on Hemi Sepolia (testnet). Confirmed from explorer.
+    pub const HEMI_SEPOLIA_POP_PAYOUTS_V2: Address =
+        alloy::primitives::address!("4a3b61C586DB4CD219E85aC0697b66916c7457AB");
+
+    // Mainnet address pending confirmation from Hemi explorer.
+    // FIXME: confirm PoPPayoutsV2 mainnet address.
 
     // ---- BitcoinTunnelManager ----
     // Confirmed from Hemi explorer + hemilabs/bitcoin-tunnel-contracts repo.

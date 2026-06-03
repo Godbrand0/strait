@@ -88,6 +88,10 @@ pub struct ApiConfig {
 // Confirmed timing constants (from Hemi documentation)
 // ============================================================================
 
+/// Hemi keystone frequency — every 25 Hemi blocks a keystone is produced.
+/// Must match PoPPayoutsV2.KEYSTONE_FREQUENCY = 25.
+pub const KEYSTONE_FREQUENCY: u32 = 25;
+
 /// Bitcoin tunnel: 6 confirmations required before minting on Hemi (~1 hour).
 pub const BTC_CONFIRMATION_DEPTH: u32 = 6;
 

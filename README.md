@@ -19,140 +19,204 @@ Supported tunnel routes:
 
 | Route | Direction | Description |
 |---|---|---|
-| `BTC_TO_HEMI` | In | Bitcoin deposit → Hemi mint of hBTC |
-| `HEMI_TO_BTC` | Out | Hemi burn → Bitcoin withdrawal |
-| `ETH_TO_HEMI` | In | Ethereum lock → Hemi mint |
-| `HEMI_TO_ETH` | Out | Hemi burn → Ethereum release |
+| `BTC_TO_HEMI` | In | Bitcoin deposit → Hemi `DepositConfirmed` → hBTC minted |
+| `HEMI_TO_BTC` | Out | `WithdrawalInitiated` on Hemi → BTC payout by vault operator |
+| `ETH_TO_HEMI` | In | Ethereum `ETHBridgeInitiated` → Hemi `ETHBridgeFinalized` |
+| `HEMI_TO_ETH` | Out | Hemi `ETHBridgeInitiated` → Ethereum release |
+
+---
+
+## Contract Addresses
+
+All addresses confirmed from the Hemi explorer and the [`hemilabs/bitcoin-tunnel-contracts`](https://github.com/hemilabs/bitcoin-tunnel-contracts) repository.
+
+### BTC Tunnel — `BitcoinTunnelManager`
+
+| Network | Address |
+|---|---|
+| Hemi Mainnet | `0xEAcA824F46c000fB89403846Bb57e6b913321081` |
+| Hemi Sepolia (testnet) | `0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e` |
+
+### ETH/ERC-20 Tunnel — `L2StandardBridge` (OP Stack)
+
+| Network | Address |
+|---|---|
+| Hemi Mainnet + Hemi Sepolia | `0x4200000000000000000000000000000000000010` |
+| Ethereum Mainnet (L1) | `0x5eaa10F99e7e6D177eF9F74E519E319aa49f191e` |
+| Ethereum Sepolia (L1) | `0xc94b1BEe63A3e101FE5F71C80F912b4F4b055925` |
+
+### BitcoinKit Precompile
+
+| Network | Address | Version |
+|---|---|---|
+| Hemi Mainnet | `0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12` | v1 |
+| Hemi Sepolia | `0xeC9fa5daC1118963933e1A675a4EEA0009b7f215` | v0 |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  GraphQL API (/graphql)  │  Webhooks  │  Playground  │
-└──────────────────────────────────────────────────────┘
-                            │
-┌──────────────────────────────────────────────────────┐
-│  Postgres (hot path)  ←  strait-store                │
-└──────────────────────────────────────────────────────┘
-                            │
-┌──────────────────────────────────────────────────────┐
-│  Join Engine  (strait-join)                          │
-│  State machine per transfer. Reorg-aware.            │
-└──────────────────────────────────────────────────────┘
-           │                │                │
-┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
-│  Bitcoin     │  │  Hemi EVM    │  │  Ethereum EVM    │
-│  Ingester    │  │  Ingester    │  │  Ingester        │
-│(strait-btc)  │  │(strait-evm)  │  │  (strait-evm)   │
-└──────────────┘  └──────────────┘  └──────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  GraphQL API (/graphql)  │  Webhooks  │  GraphiQL Playground│
+└─────────────────────────────────────────────────────────────┘
+                             │
+┌─────────────────────────────────────────────────────────────┐
+│  Postgres (hot path)  ←  strait-store                       │
+└─────────────────────────────────────────────────────────────┘
+                             │
+┌─────────────────────────────────────────────────────────────┐
+│  Join Engine  (strait-join)                                 │
+│  State machine per transfer. Reorg-aware.                   │
+└─────────────────────────────────────────────────────────────┘
+           │                  │                  │
+┌──────────────────┐  ┌──────────────┐  ┌───────────────────┐
+│ Bitcoin Ingester │  │  Hemi EVM    │  │  Ethereum EVM     │
+│ + CustodyWatcher │  │  Ingester    │  │  Ingester         │
+│  (strait-btc)    │  │ (strait-evm) │  │  (strait-evm)     │
+└──────────────────┘  └──────────────┘  └───────────────────┘
+         │                    │
+    BitcoinKit v1       BitcoinTunnelManager
+    precompile          + L2StandardBridge
+  (reads BTC state)    (emits tunnel events)
 ```
 
 ### Workspace Crates
 
 | Crate | Role |
 |---|---|
-| `strait-core` | Domain types, events, config, error types |
-| `strait-bitcoin` | Bitcoin chain ingester — polls full node, watches tunnel addresses and OP_RETURN data |
-| `strait-evm` | Generic EVM ingester — used for both Hemi and Ethereum |
-| `strait-join` | Join engine — state machine that correlates cross-chain events into `TunnelTransfer` records |
+| `strait-core` | Domain types, events, config, timing constants, error types |
+| `strait-bitcoin` | Bitcoin ingester — CustodyWatcher via BitcoinKit, OP_RETURN parsing, reorg detection |
+| `strait-evm` | EVM ingester — handles both `BitcoinTunnelManager` (BTC) and `L2StandardBridge` (ETH/ERC-20) events |
+| `strait-join` | Join engine — per-route state machine, cross-chain event matching, reorg retraction |
 | `strait-store` | Database layer — SQLx/Postgres CRUD for transfers, events, proofs, checkpoints |
-| `strait-api` | GraphQL server (async-graphql + axum) and webhook dispatcher |
+| `strait-api` | GraphQL server (async-graphql + axum) and HMAC-signed webhook dispatcher |
 | `strait-node` | Binary entrypoint — wires all crates together, manages task lifecycle |
 
 ---
 
-## Tech Stack
+## BTC Tunnel Architecture
 
-| Concern | Library |
-|---|---|
-| Async runtime | `tokio` |
-| EVM interaction (Hemi + Ethereum) | `alloy` (not ethers-rs) |
-| Bitcoin RPC | `bitcoincore-rpc`, `bitcoin` |
-| Database | `sqlx` + PostgreSQL |
-| HTTP server | `axum` |
-| GraphQL | `async-graphql`, `async-graphql-axum` |
-| Serialization | `serde`, `serde_json` |
-| Error handling | `thiserror` (libraries), `anyhow` (binary) |
-| Tracing | `tracing`, `tracing-subscriber` |
-| Config | `config` + `dotenvy` |
+The BTC tunnel is not a single contract. It is a hub-and-spoke system:
+
+- **`BitcoinTunnelManager`** — central contract. Emits all indexable events. Manages vault registry, mints/burns hBTC.
+- **`SimpleBitcoinVault`** (multiple) — per-operator vaults, each with its own Bitcoin custody address. Operators compete on fees and availability.
+- **`BTCToken` (hBTC)** — ERC-20 with 8 decimals (satoshi precision), deployed by `BitcoinTunnelManager`.
+
+### BTC→Hemi deposit flow
+
+```
+1. User sends BTC to vault custody address on Bitcoin.
+   Transaction must include an OP_RETURN output encoding their Hemi address.
+
+2. Anyone calls confirmDeposit(vaultIndex, txid, outputIndex, extraInfo)
+   on BitcoinTunnelManager.
+
+3. BitcoinTunnelManager emits:
+   DepositConfirmed(vault, recipient, depositTxId, depositSats, netSatsAfterFee)
+   ← depositTxId is the Bitcoin txid — Strait's primary cross-chain join key.
+
+4. hBTC is minted to recipient on Hemi.
+```
+
+### Hemi→BTC withdrawal flow
+
+```
+1. User calls initiateWithdrawal(vaultIndex, btcAddress, amount)
+   on BitcoinTunnelManager. hBTC is burned immediately.
+
+2. BitcoinTunnelManager emits:
+   WithdrawalInitiated(vault, withdrawer, btcAddress[hashed], withdrawalSats, netSatsAfterFee, uuid)
+   ← uuid (vaultIndex << 32 | vaultSpecificUUID) is the cross-chain join key.
+   ← btcAddress is indexed (hashed in topic) — original string NOT recoverable from the log.
+
+3. Vault operator sends BTC to the user's Bitcoin address.
+   Payout transaction includes an OP_RETURN encoding the uuid.
+
+4. Strait correlates the Hemi WithdrawalInitiated with the Bitcoin payout
+   by matching the uuid from the Bitcoin OP_RETURN.
+```
+
+### OP_RETURN encoding (confirmed)
+
+Two formats, parsed from `output.script` (not `opReturnData`):
+
+| Format | Script length | Layout |
+|---|---|---|
+| Raw bytes | 22 bytes | `0x6a` `0x14` + 20 raw address bytes |
+| ASCII hex | 42 bytes | `0x6a` `0x28` + 40 ASCII hex characters of the address |
+
+The OP_RETURN output must be within the first 8 outputs of the transaction.
 
 ---
 
-## Prerequisites
+## Domain Model
 
-- **Rust** 1.75+ (2021 edition)
-- **PostgreSQL** 14+
-- **Bitcoin full node** (or a testnet/regtest node) with RPC enabled
-- **Hemi RPC endpoint** — testnet: `https://testnet.rpc.hemi.network/rpc`
-- **Ethereum RPC endpoint** — e.g. Alchemy or Infura (Sepolia for testnet)
-- [`sqlx-cli`](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli) for running migrations
+The central object is `TunnelTransfer`:
 
----
-
-## Setup
-
-### 1. Clone and configure
-
-```bash
-git clone https://github.com/strait-data/strait
-cd strait
-cp .env.example .env
+```
+TunnelTransfer
+  id              UUID — globally unique cross-chain identifier
+  asset           BTC | ETH | ERC20
+  direction       IN (to Hemi) | OUT (from Hemi)
+  route           BTC_TO_HEMI | HEMI_TO_BTC | ETH_TO_HEMI | HEMI_TO_ETH
+  amount          BigDecimal (satoshis for BTC, wei for ETH, token units for ERC20)
+  sender          source-chain address
+  recipient       destination-chain address
+  status          INITIATED | ANCHORED | FINALIZED | FAILED | REORGED
+  initiated_at    timestamp
+  finalized_at    timestamp (null until finalized)
+  source_tx       ChainTransaction (chain, hash, block, confirmations, timestamp)
+  destination_tx  ChainTransaction (null until finalized)
+  pop_proofs      [] PoP miner submissions (BTC routes)
+  reorg_events    [] full audit log of reorgs that touched this transfer
 ```
 
-Edit `.env` with your node URLs, credentials, and contract addresses:
+### Transfer lifecycle by route
 
-```bash
-# Bitcoin
-BITCOIN_RPC_URL=http://localhost:8332
-BITCOIN_RPC_USER=user
-BITCOIN_RPC_PASSWORD=password
-BITCOIN_TUNNEL_ADDRESSES=bc1q...,...   # comma-separated custody addresses to watch
-BITCOIN_CONFIRMATION_DEPTH=6
+**BTC→Hemi:**
+```
+Bitcoin UTXO detected at custody address
+  → INITIATED   (Strait sees the Bitcoin deposit)
 
-# Hemi
-HEMI_RPC_URL=https://testnet.rpc.hemi.network/rpc
-HEMI_CHAIN_ID=743111
-HEMI_TUNNEL_CONTRACT=0x...
-HEMI_START_BLOCK=0
-HEMI_CONFIRMATION_DEPTH=3
+DepositConfirmed emitted on Hemi (depositTxId matches)
+  → ANCHORED    (~1 hour after deposit, 6 BTC confirmations)
 
-# Ethereum
-ETH_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-ETH_CHAIN_ID=11155111
-ETH_TUNNEL_CONTRACT=0x...
-ETH_START_BLOCK=0
-ETH_CONFIRMATION_DEPTH=12
+PoP proof observed (when available)
+  → FINALIZED
 
-# Database
-DATABASE_URL=postgres://postgres:password@localhost:5432/strait
-
-# API
-API_HOST=0.0.0.0
-API_PORT=8080
+Bitcoin reorg covers the deposit block → REORGED (record preserved)
 ```
 
-### 2. Create the database
+**Hemi→BTC:**
+```
+WithdrawalInitiated emitted on Hemi (uuid assigned)
+  → INITIATED
 
-```bash
-createdb strait
-sqlx migrate run
+Bitcoin payout tx detected (OP_RETURN uuid matches)
+  → ANCHORED
+
+Bitcoin payout reaches confirmation depth
+  → FINALIZED   (up to ~12 hours for operator processing)
 ```
 
-### 3. Build
+**ETH→Hemi:**
+```
+ETHBridgeInitiated / ERC20BridgeInitiated on Ethereum
+  → INITIATED
 
-```bash
-cargo build --release
+ETHBridgeFinalized / ERC20BridgeFinalized on Hemi
+  → FINALIZED   (~2 minutes typical)
 ```
 
-### 4. Run
-
-```bash
-cargo run --release -p strait-node
+**Hemi→ETH:**
 ```
+ETHBridgeInitiated on Hemi
+  → INITIATED
 
-The node starts all three ingesters, the join engine, and the API server concurrently. Shutdown cleanly with `Ctrl+C` — all tasks drain in-flight work before exiting.
+Release confirmed on Ethereum
+  → FINALIZED   (~40 min + up to 24h proof submission window)
+```
 
 ---
 
@@ -160,68 +224,128 @@ The node starts all three ingesters, the join engine, and the API server concurr
 
 ### GraphQL
 
-The GraphQL API is served at `http://localhost:8080/graphql`. In development, a GraphiQL playground is available at `http://localhost:8080/`.
+Served at `http://localhost:8080/graphql`. GraphiQL playground at `http://localhost:8080/` in development.
 
-**Query a single transfer:**
+**Query by Strait transfer ID:**
 
 ```graphql
 query {
-  tunnelTransfer(id: "uuid-here") {
+  tunnelTransfer(id: "550e8400-e29b-41d4-a716-446655440000") {
     id
-    asset
-    direction
     route
+    asset
     amount
-    sender
-    recipient
     status
     initiatedAt
     finalizedAt
-    sourceTx {
-      chain
-      hash
-      blockNumber
-      confirmations
-    }
-    destinationTx {
-      chain
-      hash
-      blockNumber
-    }
-    popProofs {
-      bitcoinTxid
-      bitcoinBlock
-      observedAt
-    }
-    reorgEvents {
-      chain
-      depth
-      affectedFromBlock
-      detectedAt
-    }
+    sourceTx { chain hash blockNumber confirmations }
+    destinationTx { chain hash blockNumber }
+    reorgEvents { chain depth affectedFromBlock detectedAt }
   }
 }
 ```
 
-**List transfers with filters:**
+**Query by Bitcoin deposit txid (BTC→Hemi):**
+
+The `depositTxId` from the `DepositConfirmed` event is the join key for BTC→Hemi transfers. Query by it directly:
 
 ```graphql
 query {
   tunnelTransfers(
     filter: {
       route: BTC_TO_HEMI
-      status: FINALIZED
-      amountGte: "1000000"          # in base units (satoshis / wei)
-      initiatedAfter: "2025-03-12T00:00:00Z"
+      sourceTxHash: "a3f7c2d1e8b4f6a9c0d2e5f8b1a4c7d0e3f6a9b2c5d8e1f4a7b0c3d6e9f2a5b8"
     }
-    first: 20
-    after: "cursor"
+    first: 1
   ) {
     edges {
-      node { id amount status initiatedAt }
-      cursor
+      node {
+        id
+        amount
+        status
+        sourceTx { hash blockNumber }   # Bitcoin deposit tx
+        destinationTx { hash }          # Hemi DepositConfirmed tx
+      }
     }
-    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
+**Query by withdrawal UUID (Hemi→BTC):**
+
+The `uuid` from `WithdrawalInitiated` is the cross-chain join key for Hemi→BTC withdrawals. It encodes `(vaultIndex << 32 | vaultSpecificUUID)`:
+
+```graphql
+query {
+  tunnelTransfers(
+    filter: {
+      route: HEMI_TO_BTC
+      withdrawalUuid: "4294967297"   # decimal string — vaultIndex=1, vaultUUID=1
+    }
+    first: 1
+  ) {
+    edges {
+      node {
+        id
+        amount
+        status
+        sourceTx { hash blockNumber }   # Hemi WithdrawalInitiated tx
+        destinationTx { hash }          # Bitcoin payout tx (null until operator pays)
+        initiatedAt
+        finalizedAt
+      }
+    }
+  }
+}
+```
+
+You can also decompose a uuid yourself:
+
+```bash
+# uuid = 8589934594
+vault_index=$((8589934594 >> 32))       # = 2
+vault_uuid=$((8589934594 & 0xFFFFFFFF)) # = 2
+```
+
+**List active withdrawals for a wallet (monitoring vault operator):**
+
+```graphql
+query PendingWithdrawals {
+  tunnelTransfers(
+    filter: {
+      route: HEMI_TO_BTC
+      status: INITIATED            # operator has not yet paid
+      sender: "0xYourWalletAddress"
+    }
+    first: 50
+  ) {
+    edges {
+      node {
+        id
+        amount
+        initiatedAt
+        sourceTx { hash }
+      }
+    }
+  }
+}
+```
+
+**Filter by vault address (operator view):**
+
+```graphql
+query VaultDeposits {
+  tunnelTransfers(
+    filter: {
+      route: BTC_TO_HEMI
+      vaultAddress: "0xVaultContractAddress"
+      status: FINALIZED
+    }
+    first: 100
+  ) {
+    edges {
+      node { id amount initiatedAt finalizedAt }
+    }
   }
 }
 ```
@@ -239,9 +363,32 @@ query {
 }
 ```
 
+**Cursor-paginated list:**
+
+```graphql
+query {
+  tunnelTransfers(
+    filter: {
+      route: BTC_TO_HEMI
+      status: FINALIZED
+      amountGte: "1000000"         # 0.01 BTC in satoshis
+      initiatedAfter: "2025-03-12T00:00:00Z"
+    }
+    first: 20
+    after: "cursor-from-previous-page"
+  ) {
+    edges {
+      node { id amount status initiatedAt }
+      cursor
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
 ### Webhooks
 
-Register a webhook to receive real-time push notifications on tunnel events:
+Register a webhook to receive real-time push notifications:
 
 ```bash
 curl -X POST http://localhost:8080/webhooks \
@@ -258,65 +405,101 @@ curl -X POST http://localhost:8080/webhooks \
   }'
 ```
 
-Every delivery is signed with `HMAC-SHA256(secret, body)` in the `X-Strait-Signature` header. Deliveries are retried up to 5 times with exponential backoff. Failed deliveries are logged at `ERROR` level.
+Every delivery is signed with `HMAC-SHA256(secret, body)` in the `X-Strait-Signature` header. Deliveries retry up to 5 times with exponential backoff.
 
----
+**Watch for failed withdrawals (operator not paying):**
 
-## Domain Model
-
-The central object is `TunnelTransfer`:
-
-```
-TunnelTransfer
-  id              UUID — globally unique cross-chain identifier
-  asset           BTC | ETH | ERC20
-  direction       IN (to Hemi) | OUT (from Hemi)
-  route           BTC_TO_HEMI | HEMI_TO_BTC | ETH_TO_HEMI | HEMI_TO_ETH
-  amount          BigDecimal (in base units)
-  sender          source-chain address
-  recipient       destination-chain address
-  status          INITIATED | ANCHORED | FINALIZED | FAILED | REORGED
-  initiated_at    timestamp
-  finalized_at    timestamp (null until finalized)
-  source_tx       ChainTransaction (chain, hash, block, confirmations, timestamp)
-  destination_tx  ChainTransaction (null until finalized)
-  pop_proofs      [] PoP miner submissions anchoring this transfer (BTC routes)
-  reorg_events    [] full audit log of any reorgs that touched this transfer
-```
-
-### Transfer Lifecycle
-
-```
-Bitcoin deposit observed
-  → INITIATED   (record created immediately)
-  → wait for Hemi TunnelMint with matching source_txid
-
-Hemi TunnelMint with matching source_txid observed
-  → ANCHORED
-
-PoP proof covering the Hemi mint block observed
-  → FINALIZED
-
-Bitcoin reorg covering the deposit block
-  → REORGED    (retraction emitted; record preserved for audit)
-
-Hemi reorg covering the mint block
-  → back to INITIATED (mint must be re-observed)
+```bash
+curl -X POST http://localhost:8080/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://your-bot.example.com/hooks/strait",
+    "secret": "secret",
+    "filter": {
+      "routes": ["HEMI_TO_BTC"],
+      "statusTransitions": ["FAILED"]
+    }
+  }'
 ```
 
 ---
 
-## Reorg Safety
+## Setup
 
-Reorgs are treated as normal control flow, not edge cases:
+### Prerequisites
 
-- Each ingester maintains a rolling window of recent block hashes beyond its confirmation depth
-- On each new block, the parent hash is verified against the stored hash for the prior block
-- A mismatch triggers a backward walk to find the fork point, emitting a `BlockReorg` event
-- The join engine consumes `BlockReorg` events and emits retraction updates for any in-flight transfers that referenced reorged transactions
-- Retractions are stored as updates with `reorg_at` set — records are never hard-deleted
+- **Rust** 1.75+ (2021 edition)
+- **PostgreSQL** 14+
+- **Bitcoin full node** with RPC enabled (or Bitcoin testnet node)
+- **Hemi RPC endpoint** — testnet: `https://testnet.rpc.hemi.network/rpc`
+- **Ethereum RPC endpoint** — e.g. Alchemy or Infura (Sepolia for testnet)
+- [`sqlx-cli`](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli)
 
-Bitcoin has the deepest reorg window (default: 6 confirmations). Hemi uses 3. Ethereum uses 12. All are configurable.
+### Quick start (testnet)
+
+```bash
+git clone https://github.com/strait-data/strait
+cd strait && cp .env.example .env
+```
+
+Edit `.env` — all testnet addresses are pre-filled:
+
+```bash
+# Hemi testnet
+HEMI_RPC_URL=https://testnet.rpc.hemi.network/rpc
+HEMI_CHAIN_ID=743111
+HEMI_TUNNEL_CONTRACT=0x4200000000000000000000000000000000000010
+HEMI_BTC_TUNNEL_CONTRACT=0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e
+HEMI_BITCOIN_KIT_CONTRACT=0xeC9fa5daC1118963933e1A675a4EEA0009b7f215
+HEMI_START_BLOCK=0
+HEMI_CONFIRMATION_DEPTH=3
+
+# Ethereum Sepolia
+ETH_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+ETH_CHAIN_ID=11155111
+ETH_TUNNEL_CONTRACT=0xc94b1BEe63A3e101FE5F71C80F912b4F4b055925
+ETH_CONFIRMATION_DEPTH=12
+
+# Bitcoin (optional — BitcoinKit covers most use cases)
+BITCOIN_RPC_URL=http://localhost:8332
+BITCOIN_RPC_USER=user
+BITCOIN_RPC_PASSWORD=password
+BITCOIN_CONFIRMATION_DEPTH=6
+
+# Database
+DATABASE_URL=postgres://postgres:password@localhost:5432/strait
+
+# API
+API_HOST=0.0.0.0
+API_PORT=8080
+```
+
+```bash
+# Start Postgres
+docker run -d --name strait-pg \
+  -e POSTGRES_PASSWORD=password \
+  -e POSTGRES_DB=strait \
+  -p 5432:5432 postgres:16
+
+# Run migrations and start
+sqlx migrate run
+cargo run --release -p strait-node
+```
+
+Shutdown cleanly with `Ctrl+C` — all tasks drain before exiting.
+
+### Mainnet addresses
+
+```bash
+HEMI_RPC_URL=https://rpc.hemi.network/rpc
+HEMI_CHAIN_ID=43111
+HEMI_TUNNEL_CONTRACT=0x4200000000000000000000000000000000000010
+HEMI_BTC_TUNNEL_CONTRACT=0xEAcA824F46c000fB89403846Bb57e6b913321081
+HEMI_BITCOIN_KIT_CONTRACT=0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12
+ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+ETH_CHAIN_ID=1
+ETH_TUNNEL_CONTRACT=0x5eaa10F99e7e6D177eF9F74E519E319aa49f191e
+```
 
 ---
 
@@ -327,21 +510,41 @@ Bitcoin has the deepest reorg window (default: 6 confirmations). Hemi uses 3. Et
 | `BITCOIN_RPC_URL` | — | Bitcoin node RPC URL |
 | `BITCOIN_RPC_USER` | — | RPC username |
 | `BITCOIN_RPC_PASSWORD` | — | RPC password |
-| `BITCOIN_TUNNEL_ADDRESSES` | — | Comma-separated tunnel custody addresses |
-| `BITCOIN_CONFIRMATION_DEPTH` | `6` | Blocks before a Bitcoin event is considered stable |
+| `BITCOIN_TUNNEL_ADDRESSES` | — | Comma-separated vault custody addresses to watch |
+| `BITCOIN_CONFIRMATION_DEPTH` | `6` | Blocks before a Bitcoin event is stable (~1 hour) |
 | `HEMI_RPC_URL` | — | Hemi RPC endpoint |
-| `HEMI_CHAIN_ID` | `43111` (mainnet) | Hemi chain ID (743111 for testnet) |
-| `HEMI_TUNNEL_CONTRACT` | — | Hemi tunnel contract address |
+| `HEMI_CHAIN_ID` | `43111` | Chain ID (743111 for testnet) |
+| `HEMI_TUNNEL_CONTRACT` | `0x4200...0010` | L2StandardBridge — ETH/ERC-20 routes |
+| `HEMI_BTC_TUNNEL_CONTRACT` | — | BitcoinTunnelManager — BTC routes |
+| `HEMI_BITCOIN_KIT_CONTRACT` | — | BitcoinKit precompile |
 | `HEMI_START_BLOCK` | `0` | Block to begin indexing from |
-| `HEMI_CONFIRMATION_DEPTH` | `3` | Blocks before a Hemi event is considered stable |
+| `HEMI_CONFIRMATION_DEPTH` | `3` | Blocks before a Hemi event is stable |
 | `ETH_RPC_URL` | — | Ethereum RPC endpoint |
-| `ETH_CHAIN_ID` | `1` (mainnet) | Ethereum chain ID |
-| `ETH_TUNNEL_CONTRACT` | — | Ethereum-side tunnel contract address |
+| `ETH_CHAIN_ID` | `1` | Chain ID (11155111 for Sepolia) |
+| `ETH_TUNNEL_CONTRACT` | — | L1StandardBridgeProxy on Ethereum |
 | `ETH_START_BLOCK` | `0` | Block to begin indexing from |
-| `ETH_CONFIRMATION_DEPTH` | `12` | Blocks before an Ethereum event is considered stable |
+| `ETH_CONFIRMATION_DEPTH` | `12` | Blocks before an Ethereum event is stable |
 | `DATABASE_URL` | — | PostgreSQL connection string |
 | `API_HOST` | `0.0.0.0` | API bind address |
 | `API_PORT` | `8080` | API bind port |
+
+---
+
+## Reorg Safety
+
+Reorgs are treated as normal control flow, not edge cases:
+
+- Each ingester maintains a rolling window of recent block hashes beyond its confirmation depth
+- On each new block, the parent hash is verified against the stored hash for the prior block
+- A mismatch triggers a backward walk to find the fork point, emitting a `BlockReorg` event
+- The join engine retracts any in-flight transfers whose source transactions were reorged out
+- Retractions are stored with a `reorg_at` timestamp — records are never hard-deleted
+
+| Chain | Default confirmation depth | Approximate window |
+|---|---|---|
+| Bitcoin | 6 | ~1 hour |
+| Hemi | 3 | ~30 seconds |
+| Ethereum | 12 | ~3 minutes |
 
 ---
 
@@ -353,6 +556,7 @@ Bitcoin has the deepest reorg window (default: 6 confirmations). Hemi uses 3. Et
 # Unit tests (no external dependencies)
 cargo test -p strait-core
 cargo test -p strait-join
+cargo test -p strait-bitcoin   # includes OP_RETURN parsing tests
 
 # Integration tests (require a running Postgres)
 DATABASE_URL=postgres://... cargo test -p strait-store
@@ -360,24 +564,24 @@ DATABASE_URL=postgres://... cargo test -p strait-store
 
 ### Structured logging
 
-Strait emits JSON-structured logs in production and pretty-printed logs in development. Control verbosity via `RUST_LOG`:
-
 ```bash
 RUST_LOG=strait=debug,sqlx=warn cargo run -p strait-node
 ```
 
-Every significant state transition (transfer created, status changed, reorg detected) emits a structured `tracing` event with the transfer ID, chain, block number, and new status. Spans correlate events across tasks for the same transfer.
+Key log lines to watch when verifying the indexer is working:
+
+```
+INFO strait_evm::ingester: DepositConfirmed — BTC deposited and hBTC minted on Hemi
+INFO strait_evm::ingester: ETHBridgeFinalized (deposit on Hemi)
+INFO strait_evm::ingester: New BTC tunnel vault created — add to watched addresses
+INFO strait_join::engine: transfer status updated old_status=Initiated new_status=Anchored
+```
 
 ### Database migrations
 
 ```bash
-# Apply all pending migrations
-sqlx migrate run
-
-# Revert the last migration
-sqlx migrate revert
-
-# Add a new migration
+sqlx migrate run       # apply pending
+sqlx migrate revert    # revert last
 sqlx migrate add <name>
 ```
 
@@ -385,15 +589,13 @@ sqlx migrate add <name>
 
 ## Open Items
 
-The following require contract addresses from Hemi's deployed infrastructure before the corresponding code is fully operational. Stubbed with config values pending confirmation:
-
-1. **Hemi tunnel contract address** — mainnet and testnet, from `https://explorer.hemi.xyz` or Hemi's GitHub
-2. **Hemi tunnel contract ABI** — specifically the `TunnelMint` and `TunnelBurn` event signatures
-3. **Bitcoin OP_RETURN encoding** — how the Hemi tunnel encodes the destination Hemi address in Bitcoin deposit transactions
-4. **PoP proof contract** — which Hemi contract emits PoP proof events and its event signature
-5. **Ethereum tunnel contract** — address and ABI for the Ethereum-side lock/release contract
-
-These are marked `// FIXME: confirm with Hemi docs` in the relevant source files.
+| Item | Status |
+|---|---|
+| ETH/ERC-20 tunnel ABI | Confirmed — OP Stack L2StandardBridge events |
+| BTC tunnel contract address + ABI | Confirmed — `BitcoinTunnelManager` from [`hemilabs/bitcoin-tunnel-contracts`](https://github.com/hemilabs/bitcoin-tunnel-contracts) |
+| OP_RETURN encoding | Confirmed — 22-byte (raw) or 42-byte (ASCII hex) from vault source |
+| PoP proof contract | **Still open** — contract address and event signature not yet confirmed |
+| Reorg frequency in production | **Still open** — ask at Hemi office hour |
 
 ---
 
@@ -405,6 +607,7 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ## Related Documents
 
+- [`docs/contract-addresses.md`](docs/contract-addresses.md) — all confirmed contract addresses and hBK interface reference
 - [`files (3)/01-strait-tunnel-indexer.md`](files%20(3)/01-strait-tunnel-indexer.md) — product specification and rationale
 - [`files (3)/02-strait-platform.md`](files%20(3)/02-strait-platform.md) — long-term platform vision
 - [`files (3)/03-strait-wedge-to-platform-strategy.md`](files%20(3)/03-strait-wedge-to-platform-strategy.md) — sequencing strategy

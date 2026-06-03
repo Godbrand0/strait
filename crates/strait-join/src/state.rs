@@ -125,6 +125,32 @@ impl TransferState {
         self.get_by_status(&TunnelStatus::Anchored)
     }
 
+    /// Find all transfers whose Hemi destination tx block falls in [from, to].
+    /// Used by the join engine to anchor transfers when a keystone fires.
+    pub fn transfers_in_hemi_block_range(&self, from: u64, to: u64) -> Vec<&TunnelTransfer> {
+        self.transfers.values().filter(|t| {
+            t.destination_tx
+                .as_ref()
+                .map(|tx| tx.chain == Chain::Hemi && tx.block_number >= from && tx.block_number <= to)
+                .unwrap_or(false)
+        }).collect()
+    }
+
+    /// Find transfers by status discriminant (matches any variant of the same enum arm).
+    pub fn transfers_by_status_discriminant(
+        &self,
+        discriminant: std::mem::Discriminant<TunnelStatus>,
+    ) -> Vec<&TunnelTransfer> {
+        self.transfers.values()
+            .filter(|t| std::mem::discriminant(&t.status) == discriminant)
+            .collect()
+    }
+
+    /// Alias for engine compatibility.
+    pub fn transfers_by_status(&self, status: &TunnelStatus) -> Vec<&TunnelTransfer> {
+        self.get_by_status(status)
+    }
+
     /// Update the latest known block for a chain.
     pub fn update_chain_tip(&mut self, chain: Chain, tip: BlockRef) {
         debug!(chain = %chain, height = tip.height, "chain tip updated");

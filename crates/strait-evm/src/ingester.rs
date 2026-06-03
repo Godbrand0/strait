@@ -23,7 +23,7 @@ use strait_core::{
     types::{Address, Asset, BitcoinTxid, ChainAddress, BitcoinAddress, TxHash},
 };
 
-use crate::contracts::{IBitcoinTunnelManager, IStandardBridge, topics};
+use crate::contracts::{IBitcoinTunnelManager, IPoPPayoutsV2, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
 
 /// EVM chain ingester that watches for tunnel contract events.
@@ -290,6 +290,24 @@ impl EvmIngester {
                     ).await?;
                 }
             }
+        // ── PoPPayoutsV2 events ────────────────────────────────────────────────
+
+        } else if topic0 == topics::payout_round_executed() {
+            // PayoutRoundExecuted(indexed blockRewarded, uint256 rewardPool, uint256 popScore)
+            // All Hemi blocks in (blockRewarded-25, blockRewarded] are now PoP-anchored.
+            let keystone_block = log_topics.get(1)
+                .map(|t| u64::from_be_bytes(t.0[24..32].try_into().unwrap_or([0u8; 8])))
+                .unwrap_or(0);
+            if let Ok(decoded) = IPoPPayoutsV2::PayoutRoundExecuted::decode_raw_log(
+                log_topics.iter().copied(), data, false,
+            ) {
+                self.handle_keystone_anchored(
+                    keystone_block,
+                    decoded.popScore.saturating_to::<u64>(),
+                    tx_hash,
+                    block_num,
+                ).await?;
+            }
         } else if topic0 == topics::vault_created() {
             // VaultCreated(indexed setupAdmin, indexed operatorAdmin, indexed vaultAddress)
             // Track new vaults so the CustodyWatcher can watch their Bitcoin addresses.
@@ -417,6 +435,32 @@ impl EvmIngester {
             destination: ChainAddress::Evm(to),
             block_number: block_num,
             log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    // ── PoPPayoutsV2 handler ──────────────────────────────────────────────────
+
+    /// Handle PayoutRoundExecuted — signals that all Hemi blocks in
+    /// (keystone_block - 25, keystone_block] are PoP-anchored on Bitcoin.
+    async fn handle_keystone_anchored(
+        &self,
+        keystone_block: u64,
+        pop_score: u64,
+        tx_hash: B256,
+        block_num: u64,
+    ) -> Result<()> {
+        info!(
+            keystone_block,
+            pop_score,
+            "PayoutRoundExecuted — Hemi blocks anchored on Bitcoin"
+        );
+        let event = RawEvent::Hemi(HemiEvent::KeystoneAnchored {
+            tx_hash: TxHash(tx_hash.0),
+            keystone_block,
+            pop_score,
+            block_number: block_num,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))

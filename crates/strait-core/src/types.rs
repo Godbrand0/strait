@@ -405,12 +405,23 @@ impl fmt::Display for ChainTxHash {
     }
 }
 
-/// Proof-of-Publication proof anchoring Hemi blocks to Bitcoin
+/// A PoP anchoring record produced when PoPPayoutsV2.PayoutRoundExecuted fires.
+///
+/// One record per Hemi keystone block (every 25 Hemi blocks). When observed,
+/// all Hemi blocks in (keystone_block - 25, keystone_block] are considered
+/// PoP-anchored on Bitcoin. A pop_score of 0 means no miners published that
+/// keystone but the sequencer still processed the round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PopProof {
-    pub bitcoin_txid: BitcoinTxid,
-    pub bitcoin_block: u64,
-    pub hemi_block_range: (u64, u64),
+    /// The Hemi keystone block that was anchored (multiple of 25).
+    pub keystone_block: u64,
+    /// Aggregate PoP score across all publications of this keystone.
+    /// 0 means no publications occurred; still counts as anchored.
+    pub pop_score: u64,
+    /// HEMI reward pool paid out for this round (in atomic units).
+    pub reward_pool: u64,
+    /// Hemi block in which this PayoutRoundExecuted event was emitted.
+    pub observed_at_block: u64,
     pub observed_at: DateTime<Utc>,
 }
 
