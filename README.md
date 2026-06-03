@@ -150,6 +150,71 @@ The OP_RETURN output must be within the first 8 outputs of the transaction.
 
 ---
 
+## PoP Anchoring — `PoPPayoutsV2`
+
+Hemi anchors its blocks to Bitcoin through Proof-of-Publication (PoP) miners. Strait watches `PoPPayoutsV2` to advance BTC→Hemi transfers from `INITIATED` to `ANCHORED`.
+
+### Contract
+
+| Network | Address |
+|---|---|
+| Hemi Sepolia (testnet) | `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB` |
+| Hemi Mainnet | Confirm from explorer (FIXME) |
+
+Source: [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts)
+
+### How it works
+
+Every **25 Hemi blocks** (~5 minutes) is a **keystone**. When PoP miners publish a keystone commitment to Bitcoin, the sequencer calls `mintPoPRewards()` on `PoPPayoutsV2`, which emits:
+
+```solidity
+event PayoutRoundExecuted(uint64 indexed blockRewarded, uint256 rewardPool, uint256 popScore);
+```
+
+`blockRewarded` is always a multiple of 25. All Hemi blocks in `(blockRewarded - 25, blockRewarded]` are now PoP-anchored on Bitcoin.
+
+### Verification logic
+
+A transfer whose Hemi mint landed at block `N` is anchored when:
+
+```
+keystone_for(N) = ceil(N / 25) * 25
+anchored when: PayoutRoundExecuted(blockRewarded >= keystone_for(N))
+```
+
+**Example:**
+
+```
+Transfer DepositConfirmed at Hemi block 12351
+  keystone_for(12351) = 12375
+
+PayoutRoundExecuted(blockRewarded=12375) fires
+  → covers blocks (12350, 12375]
+  → block 12351 is included ✓
+  → transfer advances to ANCHORED
+```
+
+### Checking anchoring status directly
+
+```bash
+# Query lastBlockRewarded — any block <= this value is PoP-anchored
+cast call 0x4a3b61C586DB4CD219E85aC0697b66916c7457AB \
+  "lastBlockRewarded()(uint64)" \
+  --rpc-url https://testnet.rpc.hemi.network/rpc
+
+# Example: returns 125000
+# Transfer minted at block 124990 → keystone 125000
+# 125000 <= 125000 → anchored ✓
+# Transfer minted at block 125001 → keystone 125025
+# 125025 > 125000 → not yet anchored
+```
+
+### Note on `popScore`
+
+A `popScore` of `0` means no miners published that keystone to Bitcoin, but the sequencer still processed the round. **A zero score does not mean the keystone is unanchored** — it means there were no publications scored, but the round was still executed and the block range is still considered PoP-finalized for Strait's purposes.
+
+---
+
 ## Domain Model
 
 The central object is `TunnelTransfer`:
@@ -168,7 +233,7 @@ TunnelTransfer
   finalized_at    timestamp (null until finalized)
   source_tx       ChainTransaction (chain, hash, block, confirmations, timestamp)
   destination_tx  ChainTransaction (null until finalized)
-  pop_proofs      [] PoP miner submissions (BTC routes)
+  pop_proofs      [] keystone anchoring records (BTC routes) — one per PayoutRoundExecuted
   reorg_events    [] full audit log of reorgs that touched this transfer
 ```
 
@@ -177,13 +242,14 @@ TunnelTransfer
 **BTC→Hemi:**
 ```
 Bitcoin UTXO detected at custody address
-  → INITIATED   (Strait sees the Bitcoin deposit)
+  → INITIATED   (Strait sees the Bitcoin deposit via BitcoinKit)
 
-DepositConfirmed emitted on Hemi (depositTxId matches)
-  → ANCHORED    (~1 hour after deposit, 6 BTC confirmations)
+DepositConfirmed emitted on Hemi (depositTxId is the join key)
+  — transfer now has a Hemi destination block N
 
-PoP proof observed (when available)
-  → FINALIZED
+PoPPayoutsV2.PayoutRoundExecuted(blockRewarded=K) fires, where K = ceil(N/25)*25
+  → ANCHORED    (keystone K covers block N — PoP-anchored on Bitcoin)
+  — typically ~5-30 min after DepositConfirmed (next keystone boundary)
 
 Bitcoin reorg covers the deposit block → REORGED (record preserved)
 ```
@@ -574,7 +640,9 @@ Key log lines to watch when verifying the indexer is working:
 INFO strait_evm::ingester: DepositConfirmed — BTC deposited and hBTC minted on Hemi
 INFO strait_evm::ingester: ETHBridgeFinalized (deposit on Hemi)
 INFO strait_evm::ingester: New BTC tunnel vault created — add to watched addresses
-INFO strait_join::engine: transfer status updated old_status=Initiated new_status=Anchored
+INFO strait_evm::ingester: PayoutRoundExecuted — Hemi blocks anchored on Bitcoin keystone_block=12375 pop_score=342000
+INFO strait_join::engine: Anchoring transfers count=3 keystone_block=12375
+INFO strait_join::engine: Transfer INITIATED → ANCHORED transfer_id=550e8400-...
 ```
 
 ### Database migrations
@@ -591,10 +659,11 @@ sqlx migrate add <name>
 
 | Item | Status |
 |---|---|
-| ETH/ERC-20 tunnel ABI | Confirmed — OP Stack L2StandardBridge events |
+| ETH/ERC-20 tunnel ABI | Confirmed — OP Stack `L2StandardBridge` events |
 | BTC tunnel contract address + ABI | Confirmed — `BitcoinTunnelManager` from [`hemilabs/bitcoin-tunnel-contracts`](https://github.com/hemilabs/bitcoin-tunnel-contracts) |
-| OP_RETURN encoding | Confirmed — 22-byte (raw) or 42-byte (ASCII hex) from vault source |
-| PoP proof contract | **Still open** — contract address and event signature not yet confirmed |
+| OP_RETURN encoding | Confirmed — 22-byte (raw) or 42-byte (ASCII hex) from `SimpleBitcoinVaultUTXOLogicHelper.sol` |
+| PoP proof contract | Confirmed — `PoPPayoutsV2` via keystone anchoring from [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts). Testnet: `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB`. Mainnet address pending. |
+| `PoPPayoutsV2` mainnet address | **Still open** — confirm from Hemi mainnet explorer |
 | Reorg frequency in production | **Still open** — ask at Hemi office hour |
 
 ---

@@ -456,11 +456,13 @@ impl EvmIngester {
             pop_score,
             "PayoutRoundExecuted — Hemi blocks anchored on Bitcoin"
         );
-        let event = RawEvent::Hemi(HemiEvent::KeystoneAnchored {
-            tx_hash: TxHash(tx_hash.0),
+        let event = RawEvent::Hemi(HemiEvent::PopKeystoneAnchored {
+            hemi_tx_hash: TxHash(tx_hash.0),
             keystone_block,
+            reward_pool: 0,
             pop_score,
             block_number: block_num,
+            log_index: 0,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))

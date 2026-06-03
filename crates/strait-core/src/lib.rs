@@ -14,6 +14,6 @@ pub use error::{Result, StraitError};
 pub use events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent};
 pub use types::{
     Address, Asset, BitcoinAddress, BitcoinTxid, BlockHash, Chain, ChainAddress, ChainTransaction,
-    ChainTxHash, PopProof, ReorgEvent, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer,
+    ChainTxHash, PopAnchor, ReorgEvent, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer,
     TxHash,
 };

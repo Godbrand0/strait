@@ -4,14 +4,14 @@
 //! # Keystone anchoring (BTC routes)
 //!
 //! BTC→Hemi transfers advance from INITIATED → ANCHORED when a
-//! `KeystoneAnchored` event covers the Hemi mint block:
+//! `PopKeystoneAnchored` event covers the Hemi mint block.
 //!
-//!   keystone_for(mint_block) = ceil(mint_block / 25) * 25
+//! `PopAnchor::covers_block(mint_block)` is the authoritative check:
+//!   window = (keystone_block - 25, keystone_block]  (exclusive lower, inclusive upper)
 //!
-//! When `PayoutRoundExecuted(blockRewarded)` fires on `PoPPayoutsV2`, every
-//! transfer whose Hemi destination tx block falls in (blockRewarded-25, blockRewarded]
-//! is advanced to ANCHORED. ETH→Hemi transfers are considered ANCHORED immediately
-//! on finalization (OP Stack finality, no PoP required).
+//! When `PayoutRoundExecuted(blockRewarded)` fires on `PoPPayoutsV2`, the engine
+//! fans out to all in-flight transfers and advances those whose mint block is covered.
+//! ETH→Hemi uses OP Stack finality — no PoP wait required.
 
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -22,7 +22,7 @@ use strait_core::{
     config::KEYSTONE_FREQUENCY,
     error::{Result, StraitError},
     events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent},
-    types::{Chain, ChainTransaction, PopProof, ReorgEvent, TunnelStatus},
+    types::{Chain, ChainTransaction, PopAnchor, ReorgEvent, TunnelStatus},
 };
 
 use crate::{matcher::EventMatcher, state::TransferState};
@@ -55,9 +55,13 @@ pub enum TunnelTransferUpdate {
         id: Uuid,
         destination_tx: ChainTransaction,
     },
-    PopProofAdded {
+    /// A PoP keystone anchored this transfer to Bitcoin.
+    /// The transfer's Hemi mint block fell within the keystone window.
+    PopAnchored {
         id: Uuid,
-        proof: PopProof,
+        keystone_block: u64,
+        pop_score: u64,
+        anchored_at: chrono::DateTime<Utc>,
     },
 }
 
@@ -136,7 +140,7 @@ impl JoinEngine {
             }
 
             // PoP keystone anchoring
-            RawEvent::Hemi(HemiEvent::KeystoneAnchored { keystone_block, pop_score, .. }) => {
+            RawEvent::Hemi(HemiEvent::PopKeystoneAnchored { keystone_block, pop_score, .. }) => {
                 self.handle_keystone_anchored(*keystone_block, *pop_score).await?;
             }
 
@@ -152,58 +156,64 @@ impl JoinEngine {
 
     // ── Keystone anchoring ────────────────────────────────────────────────────
 
-    /// Advance all INITIATED BTC→Hemi transfers whose Hemi mint block falls in
-    /// (last_anchored_keystone, keystone_block] to ANCHORED status.
+    /// Fan out a `PopKeystoneAnchored` event to all in-flight transfers.
+    ///
+    /// Uses `PopAnchor::covers_block` as the single authoritative check —
+    /// window is (keystone_block - 25, keystone_block] (exclusive, inclusive).
     async fn handle_keystone_anchored(&mut self, keystone_block: u64, pop_score: u64) -> Result<()> {
         if keystone_block <= self.last_anchored_keystone {
             debug!(keystone_block, "Duplicate or out-of-order keystone, skipping");
             return Ok(());
         }
-
-        let previous = self.last_anchored_keystone;
         self.last_anchored_keystone = keystone_block;
+
+        let anchor = PopAnchor {
+            keystone_block,
+            pop_score,
+            reward_pool: 0,
+            observed_at: Utc::now(),
+        };
 
         info!(
             keystone_block,
             pop_score,
-            covered = format!("({}, {}]", previous, keystone_block),
-            "Keystone anchored — checking for transfers to advance"
+            window = format!("({}, {}]", keystone_block.saturating_sub(PopAnchor::KEYSTONE_FREQUENCY), keystone_block),
+            "PopKeystoneAnchored — checking in-flight transfers"
         );
 
-        // Collect transfers whose Hemi destination block is in the covered range.
+        // Collect transfers whose Hemi mint block is covered by this keystone.
         let to_anchor: Vec<Uuid> = self.state
-            .transfers_in_hemi_block_range(previous + 1, keystone_block)
+            .transfers_initiated_with_hemi_mint()
             .into_iter()
-            .filter(|t| matches!(t.status, TunnelStatus::Initiated))
-            .map(|t| t.id)
+            .filter(|(_, mint_block)| anchor.covers_block(*mint_block))
+            .map(|(id, _)| id)
             .collect();
 
         if to_anchor.is_empty() {
-            debug!(keystone_block, "No transfers to anchor in this keystone");
+            debug!(keystone_block, "No transfers covered by this keystone");
             return Ok(());
         }
 
         info!(keystone_block, count = to_anchor.len(), "Anchoring transfers");
 
+        let anchored_at = Utc::now();
         for id in to_anchor {
             self.state.anchor(&id).map_err(|e| StraitError::Internal(e.to_string()))?;
+            self.state.set_pop_anchor(&id, keystone_block, pop_score, anchored_at);
 
-            let proof = PopProof {
+            self.emit(TunnelTransferUpdate::PopAnchored {
+                id,
                 keystone_block,
                 pop_score,
-                reward_pool: 0,
-                observed_at_block: keystone_block,
-                observed_at: Utc::now(),
-            };
-
-            self.emit(TunnelTransferUpdate::PopProofAdded { id, proof }).await?;
+                anchored_at,
+            }).await?;
             self.emit(TunnelTransferUpdate::StatusChanged {
                 id,
                 new_status: TunnelStatus::Anchored,
-                updated_at: Utc::now(),
+                updated_at: anchored_at,
             }).await?;
 
-            info!(transfer_id = %id, keystone_block, "Transfer INITIATED → ANCHORED");
+            info!(transfer_id = %id, keystone_block, "Transfer INITIATED → ANCHORED via PoP keystone");
         }
 
         Ok(())
@@ -310,5 +320,75 @@ mod tests {
         assert!(12375 > prev && 12375 <= keystone); // covered (on keystone)
         assert!(!(12350 > prev && 12350 <= keystone)); // NOT covered (== prev)
         assert!(!(12376 > prev && 12376 <= keystone)); // NOT covered (next keystone)
+    }
+
+    // ── PopAnchor.covers_block boundary tests ─────────────────────────────────
+    // These tests are the authoritative specification for which Hemi mint blocks
+    // get anchored by a given keystone. If these pass, the logic is correct.
+
+    fn make_anchor(keystone_block: u64) -> PopAnchor {
+        PopAnchor {
+            keystone_block,
+            pop_score: 5000,
+            reward_pool: 1_000_000,
+            observed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn covers_block_window_boundaries() {
+        // Keystone at 100, window is (75, 100]
+        let anchor = make_anchor(100);
+        let cases: &[(u64, bool)] = &[
+            (74, false), // well before window
+            (75, false), // exactly at window_start — NOT covered (exclusive lower bound)
+            (76, true),  // one past window_start — covered
+            (99, true),  // one before keystone — covered
+            (100, true), // exactly on keystone_block — covered (inclusive upper bound)
+            (101, false), // one past keystone_block — NOT covered
+            (200, false), // well after window
+        ];
+        for (mint_block, expected) in cases {
+            assert_eq!(
+                anchor.covers_block(*mint_block),
+                *expected,
+                "keystone=100, mint_block={mint_block}: expected covers={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn covers_block_keystone_at_frequency_boundary() {
+        // Keystone at exactly 25 (first possible keystone), window is (0, 25]
+        let anchor = make_anchor(25);
+        assert!(!anchor.covers_block(0));  // saturating_sub(25) = 0, so 0 > 0 is false
+        assert!(anchor.covers_block(1));
+        assert!(anchor.covers_block(25));
+        assert!(!anchor.covers_block(26));
+    }
+
+    #[test]
+    fn covers_block_at_keystone_zero_saturates() {
+        // Keystone at 0 (degenerate): window_start saturates to 0
+        // covers_block(0) = 0 > 0 && 0 <= 0 = false — correctly excluded
+        let anchor = make_anchor(0);
+        assert!(!anchor.covers_block(0));
+        assert!(!anchor.covers_block(1));
+    }
+
+    #[test]
+    fn consecutive_keystones_cover_all_blocks_without_overlap() {
+        // Blocks 1..=50 should be covered by exactly one of keystone 25 or keystone 50
+        let k25 = make_anchor(25);
+        let k50 = make_anchor(50);
+
+        for block in 1u64..=50 {
+            let in_25 = k25.covers_block(block);
+            let in_50 = k50.covers_block(block);
+            assert!(
+                in_25 ^ in_50,
+                "block {block} should be in exactly one keystone (25={in_25}, 50={in_50})"
+            );
+        }
     }
 }

@@ -137,15 +137,18 @@ pub enum HemiEvent {
     /// Emitted when PoPPayoutsV2.PayoutRoundExecuted fires on Hemi.
     ///
     /// Signals that all Hemi blocks in (keystone_block - 25, keystone_block]
-    /// are now PoP-anchored on Bitcoin. The join engine uses this to advance
-    /// transfers from INITIATED → ANCHORED once their Hemi mint block is covered.
-    KeystoneAnchored {
-        tx_hash: TxHash,
+    /// are now PoP-anchored on Bitcoin. The join engine fans this out to all
+    /// in-flight transfers and advances those whose mint block is covered.
+    PopKeystoneAnchored {
+        hemi_tx_hash: TxHash,
         /// The Hemi keystone block (multiple of 25) that was anchored.
         keystone_block: u64,
+        /// HEMI reward pool paid out (atomic units).
+        reward_pool: u64,
         /// Aggregate PoP score. 0 = no publications but still anchored.
         pop_score: u64,
         block_number: u64,
+        log_index: u32,
     },
     /// A chain reorganization was detected
     BlockReorg {
