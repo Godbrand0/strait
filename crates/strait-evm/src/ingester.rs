@@ -9,7 +9,7 @@ use std::time::Duration;
 use alloy::primitives::{Address as AlloyAddress, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
-use alloy_sol_types::SolEvent;
+use alloy::sol_types::SolEvent;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
@@ -23,7 +23,7 @@ use strait_core::{
     types::{Address, Asset, BitcoinTxid, ChainAddress, BitcoinAddress, TxHash},
 };
 
-use crate::contracts::ITunnel;
+use crate::contracts::{IBitcoinTunnel, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
 
 /// EVM chain ingester that watches for tunnel contract events.
@@ -162,6 +162,9 @@ impl EvmIngester {
     }
 
     /// Process a single log entry.
+    ///
+    /// Dispatches to either the OP Stack StandardBridge handlers (ETH/ERC-20
+    /// routes) or the BTC tunnel handlers depending on the event topic.
     async fn process_log(
         &self,
         log: Log,
@@ -171,76 +174,260 @@ impl EvmIngester {
     ) -> Result<()> {
         let tx_hash = log.transaction_hash
             .ok_or_else(|| StraitError::Parse("Missing transaction hash".into()))?;
-        
+
         let log_index = log.log_index.unwrap_or(0) as u32;
-        
-        // Get topics and data from the log
-        let topics: Vec<B256> = log.topics().to_vec();
+        let log_topics: Vec<B256> = log.topics().to_vec();
         let data = &log.data().data;
-        
-        // Try to decode each event type
-        if !topics.is_empty() {
-            let topic0 = topics[0];
-            
-            if *topic0 == *ITunnel::TunnelIn::SIGNATURE_HASH {
-                // TunnelIn: indexed receiver in topics[1], rest in data
-                if let Ok((sender_bytes, amount, txid_bytes, _block_height, _vout)) =
-                    <ITunnel::TunnelIn as SolEvent>::decode_data(data, false) 
-                {
-                    let receiver = if topics.len() > 1 {
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(&topics[1].0[12..32]);
-                        Address(addr)
-                    } else {
-                        Address([0u8; 20])
-                    };
-                    self.handle_tunnel_in(receiver, sender_bytes, amount, txid_bytes, tx_hash, block_num, log_index).await?;
-                }
-            } else if *topic0 == *ITunnel::TunnelOut::SIGNATURE_HASH {
-                // TunnelOut: indexed sender in topics[1], rest in data
-                if let Ok((receiver_bytes, amount, nonce)) = 
-                    <ITunnel::TunnelOut as SolEvent>::decode_data(data, false) 
-                {
-                    let sender = if topics.len() > 1 {
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(&topics[1].0[12..32]);
-                        Address(addr)
-                    } else {
-                        Address([0u8; 20])
-                    };
-                    self.handle_tunnel_out(sender, receiver_bytes, amount, nonce, tx_hash, block_num, log_index).await?;
-                }
-            } else if *topic0 == *ITunnel::TunnelOutComplete::SIGNATURE_HASH {
-                // TunnelOutComplete: indexed nonce in topics[1], txid in data
-                if let Ok((txid_bytes,)) = 
-                    <ITunnel::TunnelOutComplete as SolEvent>::decode_data(data, false) 
-                {
-                    let nonce = if topics.len() > 1 {
-                        U256::from_be_bytes(topics[1].0)
-                    } else {
-                        U256::ZERO
-                    };
-                    self.handle_tunnel_out_complete(nonce, txid_bytes, block_num).await?;
-                }
-            } else if *topic0 == *ITunnel::PoPSubmitted::SIGNATURE_HASH {
-                // PoPSubmitted: indexed txid in topics[1], rest in data
-                if let Ok((block_height, merkle_root, proof)) = 
-                    <ITunnel::PoPSubmitted as SolEvent>::decode_data(data, false) 
-                {
-                    let txid_bytes = if topics.len() > 1 {
-                        topics[1].0
-                    } else {
-                        [0u8; 32]
-                    };
-                    self.handle_pop_submitted(txid_bytes, block_height, merkle_root, proof, tx_hash, block_num).await?;
-                }
-            } else {
-                debug!("Unknown event topic, skipping");
-            }
+
+        if log_topics.is_empty() {
+            return Ok(());
         }
-        
+
+        let topic0 = log_topics[0];
+
+        // ── OP Stack StandardBridge events (ETH / ERC-20 routes) ─────────────
+        //
+        // alloy-sol-types 0.3 exposes `SolEvent::decode_data(data, validate)`
+        // which decodes only the non-indexed portion of a log. Indexed fields
+        // are extracted manually from the topics array.
+
+        if topic0 == topics::eth_bridge_finalized() {
+            // ETHBridgeFinalized(indexed from, indexed to, uint256 amount, bytes extraData)
+            if let (Some(from_t), Some(to_t)) = (log_topics.get(1), log_topics.get(2)) {
+                let from = addr_from_topic(from_t);
+                let to   = addr_from_topic(to_t);
+                if let Ok(decoded) = IStandardBridge::ETHBridgeFinalized::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    self.handle_eth_deposit(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                }
+            }
+        } else if topic0 == topics::eth_bridge_initiated() {
+            // ETHBridgeInitiated(indexed from, indexed to, uint256 amount, bytes extraData)
+            if let (Some(from_t), Some(to_t)) = (log_topics.get(1), log_topics.get(2)) {
+                let from = addr_from_topic(from_t);
+                let to   = addr_from_topic(to_t);
+                if let Ok(decoded) = IStandardBridge::ETHBridgeInitiated::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    self.handle_eth_withdrawal(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                }
+            }
+        } else if topic0 == topics::erc20_bridge_finalized() {
+            // ERC20BridgeFinalized(indexed localToken, indexed remoteToken, indexed from,
+            //                      address to, uint256 amount, bytes extraData)
+            if let (Some(lt), Some(rt), Some(ft)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let local_token  = addr_from_topic(lt);
+                let remote_token = addr_from_topic(rt);
+                let from         = addr_from_topic(ft);
+                if let Ok(decoded) = IStandardBridge::ERC20BridgeFinalized::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    let to = Address(decoded.to.into());
+                    self.handle_erc20_deposit(
+                        local_token, remote_token, from, to,
+                        decoded.amount, tx_hash, block_num, log_index,
+                    ).await?;
+                }
+            }
+        } else if topic0 == topics::erc20_bridge_initiated() {
+            // ERC20BridgeInitiated(indexed localToken, indexed remoteToken, indexed from,
+            //                      address to, uint256 amount, bytes extraData)
+            if let (Some(lt), Some(rt), Some(ft)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let local_token  = addr_from_topic(lt);
+                let remote_token = addr_from_topic(rt);
+                let from         = addr_from_topic(ft);
+                if let Ok(decoded) = IStandardBridge::ERC20BridgeInitiated::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    let to = Address(decoded.to.into());
+                    self.handle_erc20_withdrawal(
+                        local_token, remote_token, from, to,
+                        decoded.amount, tx_hash, block_num, log_index,
+                    ).await?;
+                }
+            }
+
+        // ── BTC tunnel events ─────────────────────────────────────────────────
+
+        } else if topic0 == topics::tunnel_in() {
+            // TunnelIn(indexed receiver, bytes sender, uint256 amount, bytes32 txid,
+            //          uint256 blockHeight, uint32 vout)
+            if let Some(receiver_t) = log_topics.get(1) {
+                let receiver = addr_from_topic(receiver_t);
+                if let Ok(decoded) = IBitcoinTunnel::TunnelIn::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    self.handle_tunnel_in(
+                        receiver, decoded.sender.to_vec(), decoded.amount,
+                        decoded.txid.into(), tx_hash, block_num, log_index,
+                    ).await?;
+                }
+            }
+        } else if topic0 == topics::tunnel_out() {
+            // TunnelOut(indexed sender, bytes receiver, uint256 amount, uint256 nonce)
+            if let Some(sender_t) = log_topics.get(1) {
+                let sender = addr_from_topic(sender_t);
+                if let Ok(decoded) = IBitcoinTunnel::TunnelOut::decode_raw_log(
+                    log_topics.iter().copied(), data, false,
+                ) {
+                    self.handle_tunnel_out(
+                        sender, decoded.receiver.to_vec(), decoded.amount,
+                        decoded.nonce, tx_hash, block_num, log_index,
+                    ).await?;
+                }
+            }
+        } else if topic0 == topics::tunnel_out_complete() {
+            // TunnelOutComplete(indexed nonce, bytes32 txid)
+            let nonce = log_topics.get(1)
+                .map(|t| U256::from_be_bytes(t.0))
+                .unwrap_or(U256::ZERO);
+            if let Ok(decoded) = IBitcoinTunnel::TunnelOutComplete::decode_raw_log(
+                log_topics.iter().copied(), data, false,
+            ) {
+                self.handle_tunnel_out_complete(nonce, decoded.txid.into(), block_num).await?;
+            }
+        } else if topic0 == topics::pop_submitted() {
+            // PoPSubmitted(indexed txid, uint256 blockHeight, bytes32 merkleRoot, bytes proof)
+            let txid_bytes: [u8; 32] = log_topics.get(1).map(|t| t.0).unwrap_or([0u8; 32]);
+            if let Ok(decoded) = IBitcoinTunnel::PoPSubmitted::decode_raw_log(
+                log_topics.iter().copied(), data, false,
+            ) {
+                self.handle_pop_submitted(
+                    txid_bytes, decoded.blockHeight, decoded.merkleRoot.into(),
+                    decoded.proof.to_vec(), tx_hash, block_num,
+                ).await?;
+            }
+        } else {
+            debug!("Unknown event topic {:?}, skipping", topic0);
+        }
+
         Ok(())
     }
+
+    // ── StandardBridge handlers (ETH / ERC-20 routes) ────────────────────────
+
+    async fn handle_eth_deposit(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+    ) -> Result<()> {
+        info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeFinalized (deposit on Hemi)");
+        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
+            tx_hash: TxHash(tx_hash.0),
+            asset: Asset::Eth,
+            amount: u256_to_bigdecimal(amount)?,
+            to,
+            source_txid: None,
+            block_number: block_num,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    async fn handle_eth_withdrawal(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+    ) -> Result<()> {
+        info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeInitiated (withdrawal from Hemi)");
+        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
+            tx_hash: TxHash(tx_hash.0),
+            asset: Asset::Eth,
+            amount: u256_to_bigdecimal(amount)?,
+            from,
+            destination: ChainAddress::Evm(to),
+            block_number: block_num,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    async fn handle_erc20_deposit(
+        &self,
+        local_token: Address,
+        _remote_token: Address,
+        from: Address,
+        to: Address,
+        amount: U256,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+    ) -> Result<()> {
+        info!(
+            token = %hex::encode(local_token.0),
+            from = %hex::encode(from.0),
+            to = %hex::encode(to.0),
+            %amount,
+            "ERC20BridgeFinalized (deposit on Hemi)"
+        );
+        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
+            tx_hash: TxHash(tx_hash.0),
+            asset: Asset::Erc20 {
+                contract: local_token,
+                symbol: String::new(),  // resolved off the token-list if needed
+                decimals: 18,
+            },
+            amount: u256_to_bigdecimal(amount)?,
+            to,
+            source_txid: None,
+            block_number: block_num,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    async fn handle_erc20_withdrawal(
+        &self,
+        local_token: Address,
+        _remote_token: Address,
+        from: Address,
+        to: Address,
+        amount: U256,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+    ) -> Result<()> {
+        info!(
+            token = %hex::encode(local_token.0),
+            from = %hex::encode(from.0),
+            to = %hex::encode(to.0),
+            %amount,
+            "ERC20BridgeInitiated (withdrawal from Hemi)"
+        );
+        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
+            tx_hash: TxHash(tx_hash.0),
+            asset: Asset::Erc20 {
+                contract: local_token,
+                symbol: String::new(),
+                decimals: 18,
+            },
+            amount: u256_to_bigdecimal(amount)?,
+            from,
+            destination: ChainAddress::Evm(to),
+            block_number: block_num,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    // ── BTC tunnel handlers ───────────────────────────────────────────────────
 
     /// Handle TunnelIn event (Bitcoin → EVM deposit claimed).
     async fn handle_tunnel_in(
@@ -379,6 +566,13 @@ impl EvmIngester {
         
         Ok(())
     }
+}
+
+/// Extract an EVM address from a 32-byte log topic (right-padded to 32 bytes).
+fn addr_from_topic(topic: &alloy::primitives::B256) -> Address {
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&topic.0[12..32]);
+    Address(addr)
 }
 
 /// Convert U256 to BigDecimal.

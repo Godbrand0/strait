@@ -11,9 +11,11 @@ strait-core = { path = "../strait-core" }
 tokio = { workspace = true }
 bitcoincore-rpc = { workspace = true }
 bitcoin = { workspace = true }
+alloy = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
+hex = "0.4"

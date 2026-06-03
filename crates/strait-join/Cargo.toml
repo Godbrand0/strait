@@ -16,3 +16,5 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
+bigdecimal = { workspace = true }
+hex = "0.4"

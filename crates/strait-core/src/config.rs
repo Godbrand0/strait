@@ -42,8 +42,16 @@ pub struct EvmChainConfig {
     pub rpc_url: String,
     /// Chain ID (43111 for Hemi mainnet, 743111 for Hemi testnet, 1 for Ethereum mainnet, 11155111 for Sepolia)
     pub chain_id: u64,
-    /// Tunnel contract address (checksummed)
+    /// Tunnel contract address (checksummed).
+    /// For ETH/ERC-20 routes: L2StandardBridge (0x4200000000000000000000000000000000000010 on Hemi).
+    /// For BTC routes: the Hemi Bitcoin tunnel contract (address TBC — FIXME: confirm with Hemi docs).
     pub tunnel_contract: String,
+    /// BitcoinKit precompile address on Hemi.
+    /// Mainnet: 0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12 (v1)
+    /// Testnet: 0xeC9fa5daC1118963933e1A675a4EEA0009b7f215 (v0)
+    /// Only relevant for the Hemi chain config — ignored for Ethereum.
+    #[serde(default)]
+    pub bitcoin_kit_contract: Option<String>,
     /// Block number to start indexing from
     #[serde(default = "default_start_block")]
     pub start_block: u64,
@@ -242,6 +250,7 @@ mod tests {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
                 chain_id: 743111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                bitcoin_kit_contract: Some("0xeC9fa5daC1118963933e1A675a4EEA0009b7f215".to_string()),
                 start_block: 0,
                 confirmation_depth: 3,
                 poll_interval_ms: 1000,
@@ -250,6 +259,7 @@ mod tests {
                 rpc_url: "https://eth-sepolia.g.alchemy.com/v2/test".to_string(),
                 chain_id: 11155111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                bitcoin_kit_contract: None,
                 start_block: 0,
                 confirmation_depth: 12,
                 poll_interval_ms: 1000,
