@@ -92,54 +92,95 @@ sol! {
 }
 
 // ============================================================================
-// Bitcoin Tunnel Contract (BTC routes)
-// FIXME: Contract address not yet confirmed — confirm with Hemi docs/explorer.
-// Event shapes reflect Hemi's architecture for Bitcoin-native tunneling.
+// BitcoinTunnelManager — central BTC tunnel hub (confirmed from repo + explorer)
+//
+// Mainnet:  0xEAcA824F46c000fB89403846Bb57e6b913321081
+// Testnet:  0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e
+//
+// Architecture (from hemilabs/bitcoin-tunnel-contracts):
+//   - BitcoinTunnelManager is the single interaction point for all BTC tunnel ops.
+//   - It manages multiple SimpleBitcoinVault instances, each with its own Bitcoin
+//     custody address. Vaults are created by operators and tracked by vaultIndex.
+//   - DepositConfirmed is the primary join key event for BTC→Hemi: it carries
+//     the Bitcoin depositTxId which is the cross-chain match key.
+//   - WithdrawalInitiated is the Hemi-side signal for Hemi→BTC outflows.
+//   - VaultCreated must be watched to discover vault custody addresses dynamically.
+//
+// hBTC token (BTCToken.sol) is a standard ERC20 deployed by BitcoinTunnelManager.
+// Decimals: 8 (matches native Bitcoin satoshi precision).
 // ============================================================================
 
 sol! {
-    /// Hemi Bitcoin tunnel contract — handles BTC ↔ hBTC transfers.
-    interface IBitcoinTunnel {
+    /// BitcoinTunnelManager — confirmed ABI from hemilabs/bitcoin-tunnel-contracts.
+    interface IBitcoinTunnelManager {
 
-        /// Emitted when a Bitcoin deposit is claimed on Hemi (BTC → Hemi).
-        /// The `txid` field is the Bitcoin deposit txid and is the primary
-        /// join key used by the join engine to correlate across chains.
-        event TunnelIn(
-            address indexed receiver,
-            bytes sender,
-            uint256 amount,
+        /// Emitted when a new vault is deployed under this tunnel manager.
+        /// Strait watches this to discover vault custody addresses to track.
+        event VaultCreated(
+            address indexed setupAdmin,
+            address indexed operatorAdmin,
+            address indexed vaultAddress
+        );
+
+        /// Emitted when a BTC deposit is confirmed on Hemi (BTC → Hemi).
+        /// depositTxId is the Bitcoin txid — the primary cross-chain join key.
+        /// netSatsAfterFee is the amount of hBTC minted to recipient.
+        event DepositConfirmed(
+            address indexed vault,
+            address indexed recipient,
+            bytes32 indexed depositTxId,
+            uint256 depositSats,
+            uint256 netSatsAfterFee
+        );
+
+        /// Emitted when a user initiates a BTC withdrawal (Hemi → BTC).
+        /// uuid encodes (vaultIndex << 32 | vaultSpecificUUID).
+        event WithdrawalInitiated(
+            address indexed vault,
+            address indexed withdrawer,
+            string indexed btcAddress,
+            uint256 withdrawalSats,
+            uint256 netSatsAfterFee,
+            uint64 uuid
+        );
+
+        /// Emitted when a withdrawal challenge succeeds (operator failed to pay).
+        /// hBTC is re-minted to the original withdrawer.
+        event WithdrawalChallengeSuccess(
+            address indexed vault,
+            address indexed withdrawer,
+            uint64 indexed uuid
+        );
+
+        /// Confirm a BTC deposit and mint hBTC to the EVM address in the OP_RETURN.
+        function confirmDeposit(
+            uint32 vaultIndex,
             bytes32 txid,
-            uint256 blockHeight,
-            uint32 vout
-        );
+            uint256 outputIndex,
+            bytes memory extraInfo
+        ) external returns (bool successful);
 
-        /// Emitted when a withdrawal to Bitcoin is initiated (Hemi → BTC).
-        event TunnelOut(
-            address indexed sender,
-            bytes receiver,
-            uint256 amount,
-            uint256 nonce
-        );
+        /// Initiate a BTC withdrawal — burns hBTC and registers the withdrawal.
+        function initiateWithdrawal(
+            uint32 vaultIndex,
+            string memory btcAddress,
+            uint256 amount
+        ) external returns (uint256 feeSats, uint64 uuid);
 
-        /// Emitted when the Bitcoin withdrawal transaction is confirmed.
-        event TunnelOutComplete(
-            uint256 indexed nonce,
-            bytes32 txid
-        );
+        /// Challenge a withdrawal that was not fulfilled within the deadline.
+        function challengeWithdrawal(
+            uint64 uuid,
+            bytes memory extraInfo
+        ) external returns (bool success);
 
-        /// Emitted when a Proof of Publication is submitted on Hemi.
-        event PoPSubmitted(
-            bytes32 indexed txid,
-            uint256 blockHeight,
-            bytes32 merkleRoot,
-            bytes proof
-        );
+        /// Get the vault contract at a given index.
+        function vaults(uint32 index) external view returns (address);
 
-        /// Check if a Bitcoin txid has already been claimed.
-        function claimed(bytes32 txid) external view returns (bool);
+        /// Total number of vaults created.
+        function vaultCounter() external view returns (uint32);
 
-        /// Get the vault address holding deposited BTC.
-        function vault() external view returns (address);
+        /// The hBTC ERC-20 token contract deployed by this manager.
+        function btcTokenContract() external view returns (address);
     }
 }
 
@@ -331,40 +372,35 @@ pub struct Erc20BridgeInitiatedEvent {
     pub extra_data: Vec<u8>,
 }
 
-/// Decoded TunnelIn event (BTC deposit claimed on Hemi).
+/// Decoded DepositConfirmed event (BTC deposit confirmed on Hemi, hBTC minted).
+/// `deposit_tx_id` is the Bitcoin txid — primary cross-chain join key.
 #[derive(Debug, Clone)]
-pub struct TunnelInEvent {
-    pub receiver: Address,
-    pub sender_bytes: Vec<u8>,
-    pub amount: U256,
-    pub txid: [u8; 32],
-    pub block_height: U256,
-    pub vout: u32,
+pub struct DepositConfirmedEvent {
+    pub vault: Address,
+    pub recipient: Address,
+    pub deposit_tx_id: [u8; 32],
+    pub deposit_sats: U256,
+    pub net_sats_after_fee: U256,
 }
 
-/// Decoded TunnelOut event (BTC withdrawal initiated from Hemi).
+/// Decoded WithdrawalInitiated event (Hemi→BTC withdrawal registered).
+/// `uuid` encodes (vaultIndex << 32 | vaultSpecificUUID).
 #[derive(Debug, Clone)]
-pub struct TunnelOutEvent {
-    pub sender: Address,
-    pub receiver_bytes: Vec<u8>,
-    pub amount: U256,
-    pub nonce: U256,
+pub struct BtcWithdrawalInitiatedEvent {
+    pub vault: Address,
+    pub withdrawer: Address,
+    pub btc_address: String,
+    pub withdrawal_sats: U256,
+    pub net_sats_after_fee: U256,
+    pub uuid: u64,
 }
 
-/// Decoded TunnelOutComplete event (BTC withdrawal confirmed on Bitcoin).
+/// Decoded VaultCreated event — needed to discover vault custody addresses.
 #[derive(Debug, Clone)]
-pub struct TunnelOutCompleteEvent {
-    pub nonce: U256,
-    pub txid: [u8; 32],
-}
-
-/// Decoded PoPSubmitted event.
-#[derive(Debug, Clone)]
-pub struct PoPSubmittedEvent {
-    pub txid: [u8; 32],
-    pub block_height: U256,
-    pub merkle_root: [u8; 32],
-    pub proof: Vec<u8>,
+pub struct VaultCreatedEvent {
+    pub setup_admin: Address,
+    pub operator_admin: Address,
+    pub vault_address: Address,
 }
 
 // ============================================================================
@@ -395,18 +431,18 @@ pub mod topics {
         keccak256(b"WithdrawalInitiated(address,address,address,address,uint256,bytes)")
     }
 
-    // BTC tunnel events
-    pub fn tunnel_in() -> B256 {
-        keccak256(b"TunnelIn(address,bytes,uint256,bytes32,uint256,uint32)")
+    // BitcoinTunnelManager events (BTC routes) — confirmed from hemilabs/bitcoin-tunnel-contracts
+    pub fn deposit_confirmed() -> B256 {
+        keccak256(b"DepositConfirmed(address,address,bytes32,uint256,uint256)")
     }
-    pub fn tunnel_out() -> B256 {
-        keccak256(b"TunnelOut(address,bytes,uint256,uint256)")
+    pub fn btc_withdrawal_initiated() -> B256 {
+        keccak256(b"WithdrawalInitiated(address,address,string,uint256,uint256,uint64)")
     }
-    pub fn tunnel_out_complete() -> B256 {
-        keccak256(b"TunnelOutComplete(uint256,bytes32)")
+    pub fn vault_created() -> B256 {
+        keccak256(b"VaultCreated(address,address,address)")
     }
-    pub fn pop_submitted() -> B256 {
-        keccak256(b"PoPSubmitted(bytes32,uint256,bytes32,bytes)")
+    pub fn withdrawal_challenge_success() -> B256 {
+        keccak256(b"WithdrawalChallengeSuccess(address,address,uint64)")
     }
 }
 
@@ -446,16 +482,16 @@ pub mod addresses {
     pub const HEMI_SEPOLIA_BITCOIN_KIT_V0: Address =
         alloy::primitives::address!("eC9fa5daC1118963933e1A675a4EEA0009b7f215");
 
-    // ---- Bitcoin tunnel contract ----
-    // FIXME: address not yet confirmed — confirm with Hemi docs/explorer.
+    // ---- BitcoinTunnelManager ----
+    // Confirmed from Hemi explorer + hemilabs/bitcoin-tunnel-contracts repo.
 
-    /// Hemi Bitcoin tunnel contract (mainnet). Address TBC.
-    pub const HEMI_BITCOIN_TUNNEL: Address =
-        alloy::primitives::address!("0000000000000000000000000000000000000000");
+    /// BitcoinTunnelManager on Hemi mainnet.
+    pub const HEMI_BITCOIN_TUNNEL_MANAGER: Address =
+        alloy::primitives::address!("EAcA824F46c000fB89403846Bb57e6b913321081");
 
-    /// Hemi Bitcoin tunnel contract (testnet). Address TBC.
-    pub const HEMI_SEPOLIA_BITCOIN_TUNNEL: Address =
-        alloy::primitives::address!("0000000000000000000000000000000000000000");
+    /// BitcoinTunnelManager on Hemi Sepolia (testnet).
+    pub const HEMI_SEPOLIA_BITCOIN_TUNNEL_MANAGER: Address =
+        alloy::primitives::address!("8221CFD3Eca3c5F9FA27b2AE774151642f1C449e");
 }
 
 // ============================================================================

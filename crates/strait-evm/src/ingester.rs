@@ -23,7 +23,7 @@ use strait_core::{
     types::{Address, Asset, BitcoinTxid, ChainAddress, BitcoinAddress, TxHash},
 };
 
-use crate::contracts::{IBitcoinTunnel, IStandardBridge, topics};
+use crate::contracts::{IBitcoinTunnelManager, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
 
 /// EVM chain ingester that watches for tunnel contract events.
@@ -252,55 +252,50 @@ impl EvmIngester {
                 }
             }
 
-        // ── BTC tunnel events ─────────────────────────────────────────────────
+        // ── BitcoinTunnelManager events (BTC routes) ──────────────────────────
+        // Confirmed from hemilabs/bitcoin-tunnel-contracts source.
 
-        } else if topic0 == topics::tunnel_in() {
-            // TunnelIn(indexed receiver, bytes sender, uint256 amount, bytes32 txid,
-            //          uint256 blockHeight, uint32 vout)
-            if let Some(receiver_t) = log_topics.get(1) {
-                let receiver = addr_from_topic(receiver_t);
-                if let Ok(decoded) = IBitcoinTunnel::TunnelIn::decode_raw_log(
+        } else if topic0 == topics::deposit_confirmed() {
+            // DepositConfirmed(indexed vault, indexed recipient, indexed depositTxId,
+            //                  uint256 depositSats, uint256 netSatsAfterFee)
+            // depositTxId is the Bitcoin txid — the primary cross-chain join key.
+            if let (Some(vault_t), Some(recipient_t), Some(txid_t)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let recipient = addr_from_topic(recipient_t);
+                let deposit_tx_id: [u8; 32] = txid_t.0;
+                if let Ok(decoded) = IBitcoinTunnelManager::DepositConfirmed::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_tunnel_in(
-                        receiver, decoded.sender.to_vec(), decoded.amount,
-                        decoded.txid.into(), tx_hash, block_num, log_index,
+                    self.handle_btc_deposit_confirmed(
+                        addr_from_topic(vault_t), recipient, deposit_tx_id,
+                        decoded.netSatsAfterFee, tx_hash, block_num, log_index,
                     ).await?;
                 }
             }
-        } else if topic0 == topics::tunnel_out() {
-            // TunnelOut(indexed sender, bytes receiver, uint256 amount, uint256 nonce)
-            if let Some(sender_t) = log_topics.get(1) {
-                let sender = addr_from_topic(sender_t);
-                if let Ok(decoded) = IBitcoinTunnel::TunnelOut::decode_raw_log(
+        } else if topic0 == topics::btc_withdrawal_initiated() {
+            // WithdrawalInitiated(indexed vault, indexed withdrawer, indexed btcAddress,
+            //                     uint256 withdrawalSats, uint256 netSatsAfterFee, uint64 uuid)
+            // Note: btcAddress is indexed so it is keccak256-hashed in topics[3] —
+            // the original string cannot be recovered from the log. The uuid in the
+            // non-indexed data is the correct cross-chain join key for this withdrawal.
+            if let Some(withdrawer_t) = log_topics.get(2) {
+                let withdrawer = addr_from_topic(withdrawer_t);
+                if let Ok(decoded) = IBitcoinTunnelManager::WithdrawalInitiated::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_tunnel_out(
-                        sender, decoded.receiver.to_vec(), decoded.amount,
-                        decoded.nonce, tx_hash, block_num, log_index,
+                    self.handle_btc_withdrawal_initiated(
+                        withdrawer, decoded.netSatsAfterFee, decoded.uuid,
+                        tx_hash, block_num, log_index,
                     ).await?;
                 }
             }
-        } else if topic0 == topics::tunnel_out_complete() {
-            // TunnelOutComplete(indexed nonce, bytes32 txid)
-            let nonce = log_topics.get(1)
-                .map(|t| U256::from_be_bytes(t.0))
-                .unwrap_or(U256::ZERO);
-            if let Ok(decoded) = IBitcoinTunnel::TunnelOutComplete::decode_raw_log(
-                log_topics.iter().copied(), data, false,
-            ) {
-                self.handle_tunnel_out_complete(nonce, decoded.txid.into(), block_num).await?;
-            }
-        } else if topic0 == topics::pop_submitted() {
-            // PoPSubmitted(indexed txid, uint256 blockHeight, bytes32 merkleRoot, bytes proof)
-            let txid_bytes: [u8; 32] = log_topics.get(1).map(|t| t.0).unwrap_or([0u8; 32]);
-            if let Ok(decoded) = IBitcoinTunnel::PoPSubmitted::decode_raw_log(
-                log_topics.iter().copied(), data, false,
-            ) {
-                self.handle_pop_submitted(
-                    txid_bytes, decoded.blockHeight, decoded.merkleRoot.into(),
-                    decoded.proof.to_vec(), tx_hash, block_num,
-                ).await?;
+        } else if topic0 == topics::vault_created() {
+            // VaultCreated(indexed setupAdmin, indexed operatorAdmin, indexed vaultAddress)
+            // Track new vaults so the CustodyWatcher can watch their Bitcoin addresses.
+            if let Some(vault_t) = log_topics.get(3) {
+                let vault_address = addr_from_topic(vault_t);
+                info!(vault = %hex::encode(vault_address.0), "New BTC tunnel vault created — add to watched addresses");
             }
         } else {
             debug!("Unknown event topic {:?}, skipping", topic0);
@@ -427,144 +422,73 @@ impl EvmIngester {
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
 
-    // ── BTC tunnel handlers ───────────────────────────────────────────────────
+    // ── BitcoinTunnelManager handlers (BTC routes) ────────────────────────────
 
-    /// Handle TunnelIn event (Bitcoin → EVM deposit claimed).
-    async fn handle_tunnel_in(
+    /// Handle DepositConfirmed (BTC → Hemi): Bitcoin deposit confirmed, hBTC minted.
+    /// `deposit_tx_id` is the Bitcoin txid — primary cross-chain join key.
+    async fn handle_btc_deposit_confirmed(
         &self,
-        receiver: Address,
-        _sender_bytes: Vec<u8>,
-        amount: U256,
-        txid_bytes: [u8; 32],
+        _vault: Address,
+        recipient: Address,
+        deposit_tx_id: [u8; 32],
+        net_sats: U256,
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
     ) -> Result<()> {
         info!(
-            receiver = %hex::encode(receiver.0),
-            amount = %amount,
-            "TunnelIn event detected"
+            recipient = %hex::encode(recipient.0),
+            bitcoin_txid = %hex::encode(deposit_tx_id),
+            net_sats = %net_sats,
+            "DepositConfirmed — BTC deposited and hBTC minted on Hemi"
         );
-        
-        let tx_hash = TxHash(tx_hash.0);
-        let amount = u256_to_bigdecimal(amount)?;
-        let source_txid = BitcoinTxid(txid_bytes);
-        
-        let raw_event = RawEvent::Hemi(HemiEvent::TunnelMint {
-            tx_hash,
+        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
+            tx_hash: TxHash(tx_hash.0),
             asset: Asset::Btc,
-            amount,
-            to: receiver,
-            source_txid: Some(source_txid),
+            amount: u256_to_bigdecimal(net_sats)?,
+            to: recipient,
+            source_txid: Some(BitcoinTxid(deposit_tx_id)),
             block_number: block_num,
             log_index,
         });
-        
-        self.event_tx.send(raw_event).await
-            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
-        
-        Ok(())
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
 
-    /// Handle TunnelOut event (EVM → Bitcoin withdrawal initiated).
-    async fn handle_tunnel_out(
+    /// Handle WithdrawalInitiated (Hemi → BTC): hBTC burned, BTC payout pending.
+    ///
+    /// The `btcAddress` field in the event is `indexed`, so it is keccak256-hashed
+    /// in the topic and the original string is unrecoverable from the log. The `uuid`
+    /// (vaultIndex << 32 | vaultSpecificUUID) is the cross-chain join key: the
+    /// Bitcoin payout transaction includes an OP_RETURN encoding this uuid.
+    async fn handle_btc_withdrawal_initiated(
         &self,
-        sender: Address,
-        receiver_bytes: Vec<u8>,
-        amount: U256,
-        _nonce: U256,
+        withdrawer: Address,
+        net_sats: U256,
+        uuid: u64,
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
     ) -> Result<()> {
         info!(
-            sender = %hex::encode(sender.0),
-            amount = %amount,
-            "TunnelOut event detected"
+            withdrawer = %hex::encode(withdrawer.0),
+            %net_sats,
+            uuid,
+            "WithdrawalInitiated — hBTC burned, BTC payout registered"
         );
-        
-        let tx_hash = TxHash(tx_hash.0);
-        let amount = u256_to_bigdecimal(amount)?;
-        
-        // Parse Bitcoin destination address from bytes
-        let dest_address = String::from_utf8_lossy(&receiver_bytes).to_string();
-        let destination = ChainAddress::Bitcoin(BitcoinAddress::new(dest_address));
-        
-        let raw_event = RawEvent::Hemi(HemiEvent::TunnelBurn {
-            tx_hash,
+        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
+            tx_hash: TxHash(tx_hash.0),
             asset: Asset::Btc,
-            amount,
-            from: sender,
-            destination,
+            amount: u256_to_bigdecimal(net_sats)?,
+            from: withdrawer,
+            // btcAddress is not recoverable from an indexed string topic.
+            // The bitcoin address will be resolved by watching the payout tx on Bitcoin.
+            destination: ChainAddress::Bitcoin(BitcoinAddress::new(format!("withdrawal-uuid-{uuid}"))),
             block_number: block_num,
             log_index,
         });
-        
-        self.event_tx.send(raw_event).await
-            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
-        
-        Ok(())
-    }
-
-    /// Handle TunnelOutComplete event (Bitcoin tx confirmed for withdrawal).
-    async fn handle_tunnel_out_complete(
-        &self,
-        nonce: U256,
-        txid_bytes: [u8; 32],
-        _block_num: u64,
-    ) -> Result<()> {
-        info!(
-            nonce = %nonce,
-            "TunnelOutComplete event detected"
-        );
-        
-        let bitcoin_txid = BitcoinTxid(txid_bytes);
-        
-        // This is a withdrawal completion - we could emit a special event
-        // For now, we'll log it as the join engine will handle matching
-        debug!(
-            nonce = %nonce,
-            bitcoin_txid = %bitcoin_txid,
-            "Withdrawal completed"
-        );
-        
-        Ok(())
-    }
-
-    /// Handle PoPSubmitted event (Proof of Publication submitted).
-    async fn handle_pop_submitted(
-        &self,
-        txid_bytes: [u8; 32],
-        block_height: U256,
-        _merkle_root: [u8; 32],
-        _proof: Vec<u8>,
-        tx_hash: B256,
-        block_num: u64,
-    ) -> Result<()> {
-        info!(
-            txid = %hex::encode(txid_bytes),
-            block_height = %block_height,
-            "PoPSubmitted event detected"
-        );
-        
-        let tx_hash = TxHash(tx_hash.0);
-        let bitcoin_txid = BitcoinTxid(txid_bytes);
-        
-        // Parse block range from the event (if available)
-        // For now, we'll use a placeholder
-        let hemi_block_range = (block_num.saturating_sub(100), block_num);
-        
-        let raw_event = RawEvent::Hemi(HemiEvent::PopProofSubmitted {
-            tx_hash,
-            bitcoin_txid,
-            hemi_block_range,
-            block_number: block_num,
-        });
-        
-        self.event_tx.send(raw_event).await
-            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
-        
-        Ok(())
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
 }
 

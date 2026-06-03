@@ -123,9 +123,11 @@ impl BitcoinKitCaller {
         )
         .map_err(|e| StraitError::Parse(format!("getTransactionOutputsByTxId decode: {e}")))?;
 
+        // Pass output.script (the full OP_RETURN script including 0x6a prefix) to
+        // parse_hemi_destination — the vault parses the script, not opReturnData.
         for output in decoded._0 {
             if output.isOpReturn {
-                return Ok(Some(output.opReturnData.to_vec()));
+                return Ok(Some(output.script.to_vec()));
             }
         }
         Ok(None)
@@ -152,38 +154,50 @@ impl BitcoinKitCaller {
 // OP_RETURN decoder
 // ============================================================================
 
-/// Attempt to parse a Hemi EVM destination address from raw OP_RETURN bytes.
+/// Parse the Hemi EVM destination address from a raw OP_RETURN output script.
 ///
-/// FIXME: The exact encoding used by the Hemi tunnel to embed the destination
-/// address in OP_RETURN payloads has not yet been confirmed from Hemi docs.
-/// This function implements two common patterns and should be validated against
-/// real testnet transactions before use in production.
+/// Encoding confirmed from hemilabs/bitcoin-tunnel-contracts source
+/// (SimpleBitcoinVaultUTXOLogicHelper.sol). The function parses `output.script`
+/// (the full Bitcoin output script including the OP_RETURN opcode), NOT
+/// `output.opReturnData`. Two formats are supported:
 ///
-/// Common patterns:
-///   1. Raw 20-byte EVM address (most compact)
-///   2. 20-byte address preceded by a 1-byte version/type prefix
-pub fn parse_hemi_destination(op_return_data: &[u8]) -> Option<Address> {
-    match op_return_data.len() {
-        // Pattern 1: raw 20-byte EVM address
-        20 => {
+///   Format 1 — 22-byte script:
+///     `0x6a` (OP_RETURN) + `0x14` (OP_PUSHBYTES_20) + <20 raw address bytes>
+///
+///   Format 2 — 42-byte script:
+///     `0x6a` (OP_RETURN) + `0x28` (OP_PUSHBYTES_40) + <40 ASCII hex address bytes>
+///
+/// The OP_RETURN output must be within the first 8 outputs of the transaction
+/// (vault code caps the scan at outputMaxLen = min(outputs.len(), 8)).
+///
+/// Note: pass `output.script`, not `output.opReturnData`.
+pub fn parse_hemi_destination(script: &[u8]) -> Option<Address> {
+    // Must start with OP_RETURN opcode (0x6a)
+    if script.first() != Some(&0x6a) {
+        return None;
+    }
+
+    match script.len() {
+        // Format 1: 0x6a 0x14 <20 raw bytes> = 22 bytes total
+        22 => {
             let mut addr = [0u8; 20];
-            addr.copy_from_slice(op_return_data);
+            addr.copy_from_slice(&script[2..22]);
             Some(Address(addr))
         }
-        // Pattern 2: 1-byte prefix + 20-byte address
-        21 => {
+        // Format 2: 0x6a 0x28 <40 ASCII hex bytes> = 42 bytes total
+        42 => {
+            let hex_bytes = &script[2..42];
+            let hex_str = std::str::from_utf8(hex_bytes).ok()?;
+            let decoded = hex::decode(hex_str).ok()?;
+            if decoded.len() != 20 {
+                return None;
+            }
             let mut addr = [0u8; 20];
-            addr.copy_from_slice(&op_return_data[1..]);
-            Some(Address(addr))
-        }
-        // Pattern 3: standard ABI-encoded address (32 bytes, right-padded)
-        32 => {
-            let mut addr = [0u8; 20];
-            addr.copy_from_slice(&op_return_data[12..32]);
+            addr.copy_from_slice(&decoded);
             Some(Address(addr))
         }
         n => {
-            warn!(bytes = n, "Unexpected OP_RETURN length — cannot parse Hemi destination");
+            warn!(bytes = n, "OP_RETURN script length does not match either known Hemi tunnel format (22 or 42 bytes)");
             None
         }
     }
@@ -283,31 +297,37 @@ pub struct DepositCandidate {
 mod tests {
     use super::*;
 
+    /// Format 1: 0x6a 0x14 <20 raw bytes> — confirmed from SimpleBitcoinVaultUTXOLogicHelper.sol
     #[test]
-    fn test_parse_hemi_destination_20_bytes() {
-        let addr_bytes = [0xABu8; 20];
-        let result = parse_hemi_destination(&addr_bytes).unwrap();
-        assert_eq!(result.0, addr_bytes);
+    fn test_format1_raw_20_bytes() {
+        let mut script = vec![0x6a, 0x14]; // OP_RETURN OP_PUSHBYTES_20
+        script.extend_from_slice(&[0xABu8; 20]);
+        let result = parse_hemi_destination(&script).unwrap();
+        assert_eq!(result.0, [0xABu8; 20]);
+    }
+
+    /// Format 2: 0x6a 0x28 <40 ASCII hex bytes> — confirmed from SimpleBitcoinVaultUTXOLogicHelper.sol
+    #[test]
+    fn test_format2_ascii_hex_40_bytes() {
+        let addr = [0xCDu8; 20];
+        let hex_str = hex::encode(addr); // "cdcdcdcd..."
+        let mut script = vec![0x6a, 0x28]; // OP_RETURN OP_PUSHBYTES_40
+        script.extend_from_slice(hex_str.as_bytes());
+        let result = parse_hemi_destination(&script).unwrap();
+        assert_eq!(result.0, addr);
     }
 
     #[test]
-    fn test_parse_hemi_destination_21_bytes_with_prefix() {
-        let mut data = vec![0x01u8]; // version prefix
-        data.extend_from_slice(&[0xCDu8; 20]);
-        let result = parse_hemi_destination(&data).unwrap();
-        assert_eq!(result.0, [0xCDu8; 20]);
+    fn test_missing_op_return_prefix_rejected() {
+        // Script without 0x6a prefix
+        let mut script = vec![0x14];
+        script.extend_from_slice(&[0xABu8; 20]);
+        assert!(parse_hemi_destination(&script).is_none());
     }
 
     #[test]
-    fn test_parse_hemi_destination_32_bytes_abi_encoded() {
-        let mut data = vec![0u8; 12];
-        data.extend_from_slice(&[0xEFu8; 20]);
-        let result = parse_hemi_destination(&data).unwrap();
-        assert_eq!(result.0, [0xEFu8; 20]);
-    }
-
-    #[test]
-    fn test_parse_hemi_destination_unknown_length() {
-        assert!(parse_hemi_destination(&[0u8; 7]).is_none());
+    fn test_unknown_length_rejected() {
+        // 0x6a prefix but wrong length
+        assert!(parse_hemi_destination(&[0x6a, 0x00, 0x01]).is_none());
     }
 }
