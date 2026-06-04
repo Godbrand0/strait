@@ -87,6 +87,8 @@ pub enum BitcoinEvent {
         to_address: BitcoinAddress,
         amount_sats: u64,
         op_return_data: Option<Vec<u8>>,
+        /// Hemi EVM destination decoded from the deposit's OP_RETURN, if parseable.
+        hemi_destination: Option<Address>,
         block_number: u64,
         block_hash: BlockHash,
         block_time: DateTime<Utc>,
@@ -222,6 +224,7 @@ mod tests {
             to_address: BitcoinAddress::new("bc1qtest"),
             amount_sats: 100000000,
             op_return_data: None,
+            hemi_destination: None,
             block_number: 100,
             block_hash: BlockHash([0; 32]),
             block_time: Utc::now(),

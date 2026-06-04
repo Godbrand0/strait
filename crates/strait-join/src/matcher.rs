@@ -407,6 +407,7 @@ mod tests {
             to_address: BitcoinAddress::new(addr),
             amount_sats,
             op_return_data: None,
+            hemi_destination: None,
             block_number: 100,
             block_hash: BlockHash([0; 32]),
             block_time: Utc::now(),

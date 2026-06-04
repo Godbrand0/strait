@@ -591,10 +591,10 @@ mod tests {
             topics::eth_bridge_initiated(),
             topics::erc20_bridge_finalized(),
             topics::erc20_bridge_initiated(),
-            topics::tunnel_in(),
-            topics::tunnel_out(),
-            topics::tunnel_out_complete(),
-            topics::pop_submitted(),
+            topics::deposit_confirmed(),
+            topics::btc_withdrawal_initiated(),
+            topics::vault_created(),
+            topics::payout_round_executed(),
         ];
         for i in 0..selectors.len() {
             for j in (i + 1)..selectors.len() {
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn test_topic_selectors_are_deterministic() {
         assert_eq!(topics::eth_bridge_finalized(), topics::eth_bridge_finalized());
-        assert_eq!(topics::tunnel_in(), topics::tunnel_in());
+        assert_eq!(topics::deposit_confirmed(), topics::deposit_confirmed());
     }
 
     #[test]

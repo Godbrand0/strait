@@ -20,8 +20,9 @@ use strait_core::{
     config::EvmChainConfig,
     error::{Result, StraitError},
     events::{RawEvent, HemiEvent},
-    types::{Address, Asset, BitcoinTxid, ChainAddress, BitcoinAddress, TxHash},
+    types::{Address, Asset, BitcoinTxid, Chain, ChainAddress, BitcoinAddress, TxHash},
 };
+use strait_store::{CheckpointRepo, Database, UpsertCheckpoint};
 
 use crate::contracts::{IBitcoinTunnelManager, IPoPPayoutsV2, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
@@ -29,25 +30,33 @@ use crate::reorg::ReorgDetector;
 /// EVM chain ingester that watches for tunnel contract events.
 pub struct EvmIngester {
     config: EvmChainConfig,
+    /// Which chain this ingester serves — used as the checkpoint key.
+    chain: Chain,
     provider: Arc<dyn Provider>,
     reorg_detector: ReorgDetector,
     event_tx: mpsc::Sender<RawEvent>,
+    /// Store handle for reading/writing the ingestion checkpoint.
+    db: Database,
 }
 
 impl EvmIngester {
-    /// Create a new EVM ingester.
+    /// Create a new EVM ingester for `chain`.
     pub fn new(
         config: EvmChainConfig,
+        chain: Chain,
         provider: Arc<dyn Provider>,
+        db: Database,
         event_tx: mpsc::Sender<RawEvent>,
     ) -> Self {
         let reorg_detector = ReorgDetector::new(config.confirmation_depth as u64);
-        
+
         Self {
             config,
+            chain,
             provider,
             reorg_detector,
             event_tx,
+            db,
         }
     }
 
@@ -74,15 +83,49 @@ impl EvmIngester {
         }
     }
 
-    /// Get the starting block height.
+    /// Determine the block to resume from (returns the last *processed* block;
+    /// the run loop continues at the next block).
+    ///
+    /// Priority: persisted checkpoint → configured `start_block` (backfill) →
+    /// near the chain tip.
     async fn get_start_block(&self) -> Result<u64> {
+        // 1. Resume from a persisted checkpoint if one exists.
+        let repo = CheckpointRepo::new(&self.db);
+        if let Some(cp) = repo.get(self.chain).await? {
+            if cp.block_height > 0 {
+                info!(
+                    chain = %self.chain,
+                    block = cp.block_height,
+                    "Resuming from persisted checkpoint"
+                );
+                return Ok(cp.block_height as u64);
+            }
+        }
+
+        // 2. Backfill from a configured start block (process start_block onward).
+        if self.config.start_block > 0 {
+            info!(chain = %self.chain, block = self.config.start_block, "Starting backfill from configured start_block");
+            return Ok(self.config.start_block.saturating_sub(1));
+        }
+
+        // 3. Otherwise start near the chain tip.
         let latest = self.provider
             .get_block_number()
             .await
             .map_err(|e| StraitError::EvmProvider(format!("Failed to get block number: {}", e)))?;
-        
-        // Start from confirmation_depth blocks ago
         Ok(latest.saturating_sub(self.config.confirmation_depth as u64))
+    }
+
+    /// Persist the ingestion checkpoint for this chain.
+    async fn save_checkpoint(&self, block_num: u64, block_hash: B256) -> Result<()> {
+        let repo = CheckpointRepo::new(&self.db);
+        repo.upsert(UpsertCheckpoint {
+            chain: self.chain,
+            block_height: block_num as i64,
+            block_hash: block_hash.to_string(),
+        })
+        .await?;
+        Ok(())
     }
 
     /// Process new blocks and emit events.
@@ -134,11 +177,14 @@ impl EvmIngester {
         
         // Get logs for tunnel contract
         let logs = self.get_tunnel_logs(block_num).await?;
-        
+
         for log in logs {
             self.process_log(log, block_num, block_hash, block_time).await?;
         }
-        
+
+        // Persist progress so a restart resumes after this block.
+        self.save_checkpoint(block_num, block_hash).await?;
+
         Ok(())
     }
 
