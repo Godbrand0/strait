@@ -246,7 +246,14 @@ pub struct TunnelTransfer {
     pub finalized_at: Option<DateTime<Utc>>,
     pub source_tx: ChainTransaction,
     pub destination_tx: Option<ChainTransaction>,
-    pub pop_proofs: Vec<PopProof>,
+    /// Whether this transfer has been PoP-anchored to Bitcoin.
+    pub pop_anchored: bool,
+    /// The Hemi keystone block (multiple of 25) that anchored this transfer.
+    pub pop_keystone_block: Option<u64>,
+    /// Aggregate PoP score of the anchoring keystone. 0 = no publications but still anchored.
+    pub pop_score: Option<u64>,
+    /// When the anchoring keystone was observed by Strait.
+    pub pop_anchored_at: Option<DateTime<Utc>>,
     pub reorg_events: Vec<ReorgEvent>,
 }
 
@@ -405,13 +412,35 @@ impl fmt::Display for ChainTxHash {
     }
 }
 
-/// Proof-of-Publication proof anchoring Hemi blocks to Bitcoin
+/// A PoP anchoring record from PoPPayoutsV2.PayoutRoundExecuted.
+///
+/// One anchor per Hemi keystone (every 25 blocks). When observed, all Hemi
+/// blocks in `(keystone_block - 25, keystone_block]` are Bitcoin-anchored.
+/// A `pop_score` of 0 means no miners published but the round still anchors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PopProof {
-    pub bitcoin_txid: BitcoinTxid,
-    pub bitcoin_block: u64,
-    pub hemi_block_range: (u64, u64),
+pub struct PopAnchor {
+    /// The Hemi keystone block anchored (always a multiple of 25).
+    pub keystone_block: u64,
+    /// Aggregate PoP score across all publications of this keystone.
+    pub pop_score: u64,
+    /// HEMI reward pool paid out for this round (in atomic units).
+    pub reward_pool: u64,
+    /// When Strait observed this anchoring event.
     pub observed_at: DateTime<Utc>,
+}
+
+impl PopAnchor {
+    /// Keystone frequency, matching PoPPayoutsV2.KEYSTONE_FREQUENCY = 25.
+    pub const KEYSTONE_FREQUENCY: u64 = 25;
+
+    /// Returns true if `hemi_block` falls within this keystone's anchoring window.
+    ///
+    /// Window: `(keystone_block - 25, keystone_block]`
+    /// — exclusive lower bound, inclusive upper bound.
+    pub fn covers_block(&self, hemi_block: u64) -> bool {
+        let window_start = self.keystone_block.saturating_sub(Self::KEYSTONE_FREQUENCY);
+        hemi_block > window_start && hemi_block <= self.keystone_block
+    }
 }
 
 /// Record of a chain reorganization event

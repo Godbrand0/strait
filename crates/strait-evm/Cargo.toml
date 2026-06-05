@@ -8,9 +8,9 @@ description = "Shared EVM ingester for Hemi and Ethereum chains"
 
 [dependencies]
 strait-core = { path = "../strait-core" }
+strait-store = { path = "../strait-store" }
 tokio = { workspace = true }
 alloy = { workspace = true }
-alloy-sol-types = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

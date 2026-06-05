@@ -10,10 +10,7 @@ use uuid::Uuid;
 
 use strait_core::{
     error::StraitError,
-    events::ChainEvent,
-    types::{
-        BlockRef, Chain, ChainTxHash, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer,
-    },
+    types::{BlockRef, Chain, ChainTxHash, TunnelStatus, TunnelTransfer},
 };
 
 /// Tracks in-flight transfers and the latest chain tip for each chain.
@@ -125,6 +122,61 @@ impl TransferState {
         self.get_by_status(&TunnelStatus::Anchored)
     }
 
+    /// Find all transfers whose Hemi destination tx block falls in [from, to].
+    /// Used by the join engine to anchor transfers when a keystone fires.
+    pub fn transfers_in_hemi_block_range(&self, from: u64, to: u64) -> Vec<&TunnelTransfer> {
+        self.transfers.values().filter(|t| {
+            t.destination_tx
+                .as_ref()
+                .map(|tx| tx.chain == Chain::Hemi && tx.block_number >= from && tx.block_number <= to)
+                .unwrap_or(false)
+        }).collect()
+    }
+
+    /// Return (id, hemi_mint_block) for all INITIATED transfers that have a
+    /// confirmed Hemi destination block — the set the keystone fan-out checks.
+    pub fn transfers_initiated_with_hemi_mint(&self) -> Vec<(uuid::Uuid, u64)> {
+        self.transfers.values()
+            .filter(|t| matches!(t.status, TunnelStatus::Initiated))
+            .filter_map(|t| {
+                t.destination_tx.as_ref()
+                    .filter(|tx| tx.chain == Chain::Hemi)
+                    .map(|tx| (t.id, tx.block_number))
+            })
+            .collect()
+    }
+
+    /// Record PoP anchoring fields on a transfer after it has been anchored.
+    pub fn set_pop_anchor(
+        &mut self,
+        id: &uuid::Uuid,
+        keystone_block: u64,
+        pop_score: u64,
+        anchored_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Some(t) = self.transfers.get_mut(id) {
+            t.pop_anchored = true;
+            t.pop_keystone_block = Some(keystone_block);
+            t.pop_score = Some(pop_score);
+            t.pop_anchored_at = Some(anchored_at);
+        }
+    }
+
+    /// Find transfers by status discriminant (matches any variant of the same enum arm).
+    pub fn transfers_by_status_discriminant(
+        &self,
+        discriminant: std::mem::Discriminant<TunnelStatus>,
+    ) -> Vec<&TunnelTransfer> {
+        self.transfers.values()
+            .filter(|t| std::mem::discriminant(&t.status) == discriminant)
+            .collect()
+    }
+
+    /// Alias for engine compatibility.
+    pub fn transfers_by_status(&self, status: &TunnelStatus) -> Vec<&TunnelTransfer> {
+        self.get_by_status(status)
+    }
+
     /// Update the latest known block for a chain.
     pub fn update_chain_tip(&mut self, chain: Chain, tip: BlockRef) {
         debug!(chain = %chain, height = tip.height, "chain tip updated");
@@ -213,7 +265,8 @@ impl Default for TransferState {
 mod tests {
     use super::*;
     use strait_core::types::{
-        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TxHash,
+        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TunnelDirection,
+        TunnelRoute, TxHash,
     };
     use chrono::Utc;
 
@@ -240,7 +293,10 @@ mod tests {
                 confirmations: 1,
             },
             destination_tx: None,
-            pop_proofs: vec![],
+            pop_anchored: false,
+            pop_keystone_block: None,
+            pop_score: None,
+            pop_anchored_at: None,
             reorg_events: vec![],
         }
     }

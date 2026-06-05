@@ -87,6 +87,8 @@ pub enum BitcoinEvent {
         to_address: BitcoinAddress,
         amount_sats: u64,
         op_return_data: Option<Vec<u8>>,
+        /// Hemi EVM destination decoded from the deposit's OP_RETURN, if parseable.
+        hemi_destination: Option<Address>,
         block_number: u64,
         block_hash: BlockHash,
         block_time: DateTime<Utc>,
@@ -134,12 +136,21 @@ pub enum HemiEvent {
         block_number: u64,
         log_index: u32,
     },
-    /// A PoP proof submission anchoring Hemi blocks to Bitcoin
-    PopProofSubmitted {
-        tx_hash: TxHash,
-        bitcoin_txid: BitcoinTxid,
-        hemi_block_range: (u64, u64),
+    /// Emitted when PoPPayoutsV2.PayoutRoundExecuted fires on Hemi.
+    ///
+    /// Signals that all Hemi blocks in (keystone_block - 25, keystone_block]
+    /// are now PoP-anchored on Bitcoin. The join engine fans this out to all
+    /// in-flight transfers and advances those whose mint block is covered.
+    PopKeystoneAnchored {
+        hemi_tx_hash: TxHash,
+        /// The Hemi keystone block (multiple of 25) that was anchored.
+        keystone_block: u64,
+        /// HEMI reward pool paid out (atomic units).
+        reward_pool: u64,
+        /// Aggregate PoP score. 0 = no publications but still anchored.
+        pop_score: u64,
         block_number: u64,
+        log_index: u32,
     },
     /// A chain reorganization was detected
     BlockReorg {
@@ -213,6 +224,7 @@ mod tests {
             to_address: BitcoinAddress::new("bc1qtest"),
             amount_sats: 100000000,
             op_return_data: None,
+            hemi_destination: None,
             block_number: 100,
             block_hash: BlockHash([0; 32]),
             block_time: Utc::now(),
