@@ -16,7 +16,6 @@
 
 use std::time::Duration;
 
-use bigdecimal::ToPrimitive;
 use chrono::Utc;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -72,10 +71,11 @@ impl BtcPayoutWatcher {
             if !is_real_btc_address(&w.recipient) {
                 continue; // placeholder recipient — nothing to watch yet
             }
-            let want_sats = match w.amount.to_u64() {
-                Some(s) if s > 0 => s,
-                _ => continue,
-            };
+            // The withdrawal's 4-byte vaultUUID is echoed in the payout's OP_RETURN —
+            // the deterministic key that disambiguates otherwise-identical withdrawals
+            // (same recipient + amount). Without it, amount matching mis-attributes.
+            let Some(uuid) = w.withdrawal_uuid else { continue };
+            let want_vault_uuid = (uuid as u64 & 0xffff_ffff) as u32;
 
             let utxos = match self.caller.get_utxos_for_address(&w.recipient).await {
                 Ok(u) => u,
@@ -86,19 +86,20 @@ impl BtcPayoutWatcher {
             };
 
             for utxo in utxos {
-                let value = utxo.value.saturating_to::<u64>();
-                if !amount_matches(value, want_sats) {
+                let txid = BitcoinTxid(utxo.txId.into());
+
+                // Match the payout to THIS exact withdrawal via its OP_RETURN vaultUUID.
+                let payout_uuid = match self.caller.get_op_return_data(&txid).await {
+                    Ok(Some(script)) => decode_payout_vault_uuid(&script),
+                    _ => None,
+                };
+                if payout_uuid != Some(want_vault_uuid) {
                     continue;
                 }
-                let txid = BitcoinTxid(utxo.txId.into());
+
                 let confs = self.caller.get_confirmations(&txid).await.unwrap_or(0);
                 if confs < self.min_confirmations {
-                    continue; // payout seen but not yet final
-                }
-
-                // Log any OP_RETURN on the payout — helps confirm the uuid encoding.
-                if let Ok(Some(op)) = self.caller.get_op_return_data(&txid).await {
-                    info!(txid = %hex::encode(txid.0), op_return = %hex::encode(&op), "payout OP_RETURN");
+                    continue; // payout matched but not yet final
                 }
 
                 // Bitcoin network fee for the payout (Σ inputs − Σ outputs), best-effort.
@@ -110,11 +111,12 @@ impl BtcPayoutWatcher {
                 info!(
                     transfer = %w.id,
                     recipient = %w.recipient,
-                    sats = value,
+                    uuid,
+                    sats = utxo.value.saturating_to::<u64>(),
                     fee_sats = ?fee_sats,
                     confirmations = confs,
                     txid = %txid_hex,
-                    "Hemi→BTC withdrawal FINALIZED — Bitcoin payout observed"
+                    "Hemi→BTC withdrawal FINALIZED — Bitcoin payout matched by uuid"
                 );
                 break;
             }
@@ -133,14 +135,15 @@ fn is_real_btc_address(s: &str) -> bool {
     matches!(s.chars().next(), Some('b' | 't' | '1' | '3' | 'm' | 'n' | '2'))
 }
 
-/// Match a payout UTXO value to the withdrawal's net sats, tolerating a small
-/// Bitcoin-fee difference (≤1% or 1000 sats, whichever is larger).
-fn amount_matches(utxo_sats: u64, net_sats: u64) -> bool {
-    if utxo_sats == 0 || net_sats == 0 {
-        return false;
+/// Decode the 4-byte big-endian vaultUUID from a payout OP_RETURN script
+/// (`0x6a 0x04 <4 bytes>`, confirmed from a real mainnet payout). Returns `None`
+/// if the script isn't that shape.
+fn decode_payout_vault_uuid(script: &[u8]) -> Option<u32> {
+    if script.len() >= 6 && script[0] == 0x6a && script[1] == 0x04 {
+        Some(u32::from_be_bytes([script[2], script[3], script[4], script[5]]))
+    } else {
+        None
     }
-    let tol = (net_sats / 100).max(1000);
-    utxo_sats.abs_diff(net_sats) <= tol
 }
 
 #[cfg(test)]
@@ -148,11 +151,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_and_near_amounts_match() {
-        assert!(amount_matches(598_800, 598_800));        // exact
-        assert!(amount_matches(598_000, 598_800));        // within 1000 sats
-        assert!(!amount_matches(500_000, 598_800));       // too far off
-        assert!(!amount_matches(0, 598_800));             // zero never matches
+    fn decodes_payout_vault_uuid() {
+        // Real mainnet payout OP_RETURN: 6a 04 00 00 03 27 → vaultUUID 807.
+        assert_eq!(decode_payout_vault_uuid(&[0x6a, 0x04, 0, 0, 0x03, 0x27]), Some(807));
+        assert_eq!(decode_payout_vault_uuid(&[0x6a, 0x14, 0xAB]), None); // wrong push len
+        assert_eq!(decode_payout_vault_uuid(&[0x00]), None);             // not OP_RETURN
     }
 
     #[test]

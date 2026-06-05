@@ -35,6 +35,7 @@ fn transfer(
         amount: bigdecimal::BigDecimal::from(amount),
         source_fee: None,
         dest_fee: None,
+        withdrawal_uuid: None,
         sender,
         recipient,
         status,

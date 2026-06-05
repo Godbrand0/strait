@@ -216,6 +216,7 @@ mod tests {
             }),
             source_fee: None,
             dest_fee: None,
+            withdrawal_uuid: None,
             pop_anchored: false,
             pop_keystone_block: None,
             pop_score: None,

@@ -407,6 +407,7 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
         destination_tx: None,
         source_fee: None,
         dest_fee: None,
+        withdrawal_uuid: None,
         pop_anchored: false,
         pop_keystone_block: None,
         pop_score: None,
@@ -504,6 +505,7 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                 }),
                 source_fee: None,
                 dest_fee: gas_fee.clone(),
+                withdrawal_uuid: None,
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,
@@ -521,6 +523,7 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             block_number,
             log_index,
             gas_fee,
+            uuid,
         } => {
             let route = match destination {
                 ChainAddress::Bitcoin(_) => TunnelRoute::HemiToBtc,
@@ -549,6 +552,7 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                 destination_tx: None,
                 source_fee: gas_fee.clone(),
                 dest_fee: None,
+                withdrawal_uuid: *uuid,
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,

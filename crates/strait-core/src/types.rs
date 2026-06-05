@@ -250,6 +250,9 @@ pub struct TunnelTransfer {
     pub source_fee: Option<BigDecimal>,
     /// Network fee paid on the destination leg, in that chain's atomic unit (wei or sats).
     pub dest_fee: Option<BigDecimal>,
+    /// BTC withdrawal uuid (vaultIndex << 32 | vaultUUID); `None` for other routes.
+    /// Used to match the Bitcoin payout (which echoes the vaultUUID in its OP_RETURN).
+    pub withdrawal_uuid: Option<u64>,
     /// Whether this transfer has been PoP-anchored to Bitcoin.
     pub pop_anchored: bool,
     /// The Hemi keystone block (multiple of 25) that anchored this transfer.

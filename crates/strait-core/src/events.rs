@@ -139,6 +139,9 @@ pub enum HemiEvent {
         log_index: u32,
         /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,
+        /// BTC withdrawal uuid (vaultIndex << 32 | vaultUUID); `None` for ETH routes.
+        /// The 4-byte vaultUUID is echoed in the Bitcoin payout's OP_RETURN.
+        uuid: Option<u64>,
     },
     /// Emitted when PoPPayoutsV2.PayoutRoundExecuted fires on Hemi.
     ///

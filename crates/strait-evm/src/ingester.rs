@@ -495,6 +495,7 @@ impl EvmIngester {
                 block_number: block_num,
                 log_index,
                 gas_fee,
+                uuid: None,
             })
         };
         self.event_tx.send(event).await
@@ -591,6 +592,7 @@ impl EvmIngester {
                 block_number: block_num,
                 log_index,
                 gas_fee,
+                uuid: None,
             })
         };
         self.event_tx.send(event).await
@@ -699,6 +701,7 @@ impl EvmIngester {
             block_number: block_num,
             log_index,
             gas_fee: self.fetch_gas_fee(tx_hash).await,
+            uuid: Some(uuid),
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))

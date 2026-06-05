@@ -42,6 +42,8 @@ pub struct TunnelTransferRow {
     pub source_fee: Option<BigDecimal>,
     #[serde(serialize_with = "serialize_opt_plain_decimal")]
     pub dest_fee: Option<BigDecimal>,
+    /// BTC withdrawal uuid, used to match the Bitcoin payout by its OP_RETURN.
+    pub withdrawal_uuid: Option<i64>,
 
     pub pop_anchored: bool,
     pub pop_keystone_block: Option<i64>,
@@ -86,9 +88,9 @@ impl<'a> TunnelTransferRepo<'a> {
                 dest_chain, dest_tx_hash, dest_block,
                 pop_anchored, pop_keystone_block, pop_score, pop_anchored_at,
                 initiated_at, finalized_at,
-                source_fee, dest_fee
+                source_fee, dest_fee, withdrawal_uuid
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             ON CONFLICT (id) DO UPDATE SET
                 -- Never let a late INITIATED event regress an advanced status.
                 status             = CASE WHEN EXCLUDED.status = 'INITIATED'
@@ -113,6 +115,7 @@ impl<'a> TunnelTransferRepo<'a> {
                 finalized_at       = COALESCE(EXCLUDED.finalized_at, tunnel_transfers.finalized_at),
                 source_fee         = COALESCE(EXCLUDED.source_fee, tunnel_transfers.source_fee),
                 dest_fee           = COALESCE(EXCLUDED.dest_fee, tunnel_transfers.dest_fee),
+                withdrawal_uuid    = COALESCE(EXCLUDED.withdrawal_uuid, tunnel_transfers.withdrawal_uuid),
                 updated_at         = NOW()
             "#,
         )
@@ -139,6 +142,7 @@ impl<'a> TunnelTransferRepo<'a> {
         .bind(t.finalized_at)
         .bind(t.source_fee.clone())
         .bind(t.dest_fee.clone())
+        .bind(t.withdrawal_uuid.map(|v| v as i64))
         .execute(self.pool)
         .await
         .map_err(StraitError::Database)?;
@@ -371,6 +375,7 @@ mod db_tests {
             amount: BigDecimal::from(130_000_000_000_000_000u64),
             source_fee: None,
             dest_fee: None,
+            withdrawal_uuid: None,
             sender: ChainAddress::Evm(to),
             recipient: ChainAddress::Evm(to),
             status: TunnelStatus::Initiated,
@@ -477,6 +482,7 @@ mod db_tests {
             amount: BigDecimal::from(amount),
             source_fee: None,
             dest_fee: None,
+            withdrawal_uuid: None,
             sender: ChainAddress::Bitcoin(BitcoinAddress::new("btctx:..")),
             recipient: ChainAddress::Evm(to),
             status,

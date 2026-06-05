@@ -279,6 +279,7 @@ mod tests {
             amount: bigdecimal::BigDecimal::from(100_000),
             source_fee: None,
             dest_fee: None,
+            withdrawal_uuid: None,
             sender: strait_core::types::ChainAddress::Bitcoin(
                 strait_core::types::BitcoinAddress::new("bc1qtest"),
             ),
