@@ -33,6 +33,8 @@ fn transfer(
         direction,
         route,
         amount: bigdecimal::BigDecimal::from(amount),
+        source_fee: None,
+        dest_fee: None,
         sender,
         recipient,
         status,

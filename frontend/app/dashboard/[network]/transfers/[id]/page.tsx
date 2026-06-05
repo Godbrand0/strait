@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import {
   getTransfer,
   formatAmount,
@@ -9,6 +10,9 @@ import {
   timeAgo,
   txExplorerUrl,
   sourceObserved,
+  formatFee,
+  isNetwork,
+  type Network,
   type Transfer,
 } from "@/lib/strait";
 
@@ -26,12 +30,15 @@ type Step = {
 export default async function TransferDetailPage({
   params,
 }: {
-  params: Promise<{ id: string }>;
+  params: Promise<{ network: string; id: string }>;
 }) {
-  const { id } = await params;
-  const t = await getTransfer(id);
+  const { network: seg, id } = await params;
+  if (!isNetwork(seg)) notFound();
+  const network: Network = seg;
 
-  if (!t) return <NotFound id={id} />;
+  const t = await getTransfer(id, network);
+
+  if (!t) return <NotFound id={id} network={network} />;
 
   const s = statusStyle(t.status);
   const kind = transferKind(t.direction);
@@ -39,7 +46,7 @@ export default async function TransferDetailPage({
 
   return (
     <div className="space-y-8">
-      <Link href="/dashboard" className="text-sm text-zinc-400 hover:text-white transition-colors">
+      <Link href={`/dashboard/${network}`} className="text-sm text-zinc-400 hover:text-white transition-colors">
         ← All transfers
       </Link>
 
@@ -69,7 +76,7 @@ export default async function TransferDetailPage({
           <h2 className="mb-5 text-sm font-medium text-zinc-300">Finality lifecycle</h2>
           <ol className="relative">
             {steps.map((step, i) => (
-              <TimelineStep key={i} step={step} last={i === steps.length - 1} />
+              <TimelineStep key={i} step={step} last={i === steps.length - 1} network={network} />
             ))}
           </ol>
           {t.popAnchored && (
@@ -100,8 +107,17 @@ export default async function TransferDetailPage({
               chain={t.sourceChain}
               hash={sourceObserved(t) ? t.sourceTxHash : null}
               block={sourceObserved(t) ? t.sourceBlock : null}
+              fee={t.sourceFee}
+              network={network}
             />
-            <TxField label="Destination" chain={t.destChain} hash={t.destTxHash} block={t.destBlock} />
+            <TxField
+              label="Destination"
+              chain={t.destChain}
+              hash={t.destTxHash}
+              block={t.destBlock}
+              fee={t.destFee}
+              network={network}
+            />
             <div className="h-px bg-white/[0.06]" />
             <Field label="Initiated" value={timeAgo(t.initiatedAt)} />
             <Field label="Finalized" value={t.finalizedAt ? timeAgo(t.finalizedAt) : "—"} />
@@ -174,8 +190,8 @@ function buildTimeline(t: Transfer): Step[] {
   return steps;
 }
 
-function TimelineStep({ step, last }: { step: Step; last: boolean }) {
-  const url = txExplorerUrl(step.chain, step.hash);
+function TimelineStep({ step, last, network }: { step: Step; last: boolean; network: Network }) {
+  const url = txExplorerUrl(step.chain, step.hash, network);
   return (
     <li className="relative flex gap-4 pb-7 last:pb-0">
       {!last && (
@@ -216,8 +232,9 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
   );
 }
 
-function TxField({ label, chain, hash, block }: { label: string; chain: string | null; hash: string | null; block: number | null }) {
-  const url = txExplorerUrl(chain, hash);
+function TxField({ label, chain, hash, block, fee, network }: { label: string; chain: string | null; hash: string | null; block: number | null; fee?: string | null; network: Network }) {
+  const url = txExplorerUrl(chain, hash, network);
+  const feeText = formatFee(chain, fee ?? null);
   return (
     <div className="flex items-center justify-between gap-4">
       <dt className="text-zinc-500">{label}</dt>
@@ -234,6 +251,7 @@ function TxField({ label, chain, hash, block }: { label: string; chain: string |
             <div className="text-xs text-zinc-500">
               {chain}{block ? ` · block ${block.toLocaleString()}` : ""}
             </div>
+            {feeText && <div className="text-xs text-zinc-500">fee {feeText}</div>}
           </>
         ) : (
           <span className="text-zinc-600">pending</span>
@@ -243,12 +261,12 @@ function TxField({ label, chain, hash, block }: { label: string; chain: string |
   );
 }
 
-function NotFound({ id }: { id: string }) {
+function NotFound({ id, network }: { id: string; network: Network }) {
   return (
     <div className="rounded-xl border border-dashed border-white/10 px-6 py-16 text-center">
       <h1 className="text-lg font-semibold text-zinc-200">Transfer not found</h1>
       <p className="mt-2 font-mono text-xs text-zinc-500">{id}</p>
-      <Link href="/dashboard" className="mt-4 inline-block text-sm text-orange-400 hover:text-orange-300">
+      <Link href={`/dashboard/${network}`} className="mt-4 inline-block text-sm text-orange-400 hover:text-orange-300">
         ← Back to explorer
       </Link>
     </div>

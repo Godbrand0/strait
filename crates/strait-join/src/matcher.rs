@@ -423,6 +423,7 @@ mod tests {
             source_txid,
             block_number: 200,
             log_index: 0,
+            gas_fee: None,
         })
     }
 

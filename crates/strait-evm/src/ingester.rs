@@ -219,6 +219,15 @@ impl EvmIngester {
         Ok((hash, time))
     }
 
+    /// Fetch the gas fee spent on a transaction (wei = gasUsed * effectiveGasPrice).
+    /// Best-effort — returns None if the receipt can't be fetched.
+    async fn fetch_gas_fee(&self, tx_hash: B256) -> Option<bigdecimal::BigDecimal> {
+        let receipt = self.provider.get_transaction_receipt(tx_hash).await.ok()??;
+        let fee = U256::from(receipt.gas_used)
+            .checked_mul(U256::from(receipt.effective_gas_price))?;
+        u256_to_bigdecimal(fee).ok()
+    }
+
     /// Get tunnel-contract logs across a window of blocks `[from_block, to_block]`.
     async fn get_tunnel_logs(&self, from_block: u64, to_block: u64) -> Result<Vec<Log>> {
         // Watch the ETH/ERC-20 tunnel (L2StandardBridge / L1 bridge) and, on Hemi,
@@ -432,6 +441,7 @@ impl EvmIngester {
             source_txid: None,
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -455,6 +465,7 @@ impl EvmIngester {
             destination: ChainAddress::Evm(to),
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -490,6 +501,7 @@ impl EvmIngester {
             source_txid: None,
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -525,6 +537,7 @@ impl EvmIngester {
             destination: ChainAddress::Evm(to),
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -586,6 +599,7 @@ impl EvmIngester {
             source_txid: Some(BitcoinTxid(deposit_tx_id)),
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -630,6 +644,7 @@ impl EvmIngester {
             destination,
             block_number: block_num,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))

@@ -383,6 +383,8 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
             confirmations: 0,
         },
         destination_tx: None,
+        source_fee: None,
+        dest_fee: None,
         pop_anchored: false,
         pop_keystone_block: None,
         pop_score: None,
@@ -410,6 +412,7 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             source_txid,
             block_number,
             log_index,
+            gas_fee,
         } => {
             let route = if matches!(asset, Asset::Btc) {
                 TunnelRoute::BtcToHemi
@@ -477,6 +480,8 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                     timestamp: now,
                     confirmations: 0,
                 }),
+                source_fee: None,
+                dest_fee: gas_fee.clone(),
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,
@@ -493,6 +498,7 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             destination,
             block_number,
             log_index,
+            gas_fee,
         } => {
             let route = match destination {
                 ChainAddress::Bitcoin(_) => TunnelRoute::HemiToBtc,
@@ -519,6 +525,8 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                     confirmations: 0,
                 },
                 destination_tx: None,
+                source_fee: gas_fee.clone(),
+                dest_fee: None,
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,
@@ -669,6 +677,7 @@ mod tests {
             source_txid: None,
             block_number: REAL_BLOCK,
             log_index: 1,
+            gas_fee: None,
         })
     }
 
@@ -710,6 +719,7 @@ mod tests {
                 source_txid: Some(BitcoinTxid([3u8; 32])),
                 block_number: REAL_BLOCK,
                 log_index: 1,
+                gas_fee: None,
             }))
             .await
             .unwrap();
@@ -801,6 +811,7 @@ mod tests {
                 source_txid: Some(txid),
                 block_number: 6_037_628,
                 log_index: 0,
+                gas_fee: None,
             }))
             .await
             .unwrap();

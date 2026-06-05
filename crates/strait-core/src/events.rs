@@ -125,6 +125,8 @@ pub enum HemiEvent {
         source_txid: Option<BitcoinTxid>,
         block_number: u64,
         log_index: u32,
+        /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A tunnel burn (assets being withdrawn from Hemi)
     TunnelBurn {
@@ -135,6 +137,8 @@ pub enum HemiEvent {
         destination: ChainAddress,
         block_number: u64,
         log_index: u32,
+        /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// Emitted when PoPPayoutsV2.PayoutRoundExecuted fires on Hemi.
     ///
