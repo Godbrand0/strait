@@ -184,6 +184,49 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
+    /// List Hemi→BTC withdrawals still awaiting their Bitcoin payout (status
+    /// `INITIATED`), most recent first — candidates for payout matching.
+    pub async fn list_pending_btc_payouts(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_BTC' AND status = 'INITIATED'
+             ORDER BY initiated_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// Record the observed Bitcoin payout for a Hemi→BTC withdrawal and finalize it.
+    pub async fn set_btc_payout(
+        &self,
+        id: Uuid,
+        payout_txid: &str,
+        payout_block: Option<i64>,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE tunnel_transfers
+             SET status = 'FINALIZED',
+                 dest_chain = 'BITCOIN',
+                 dest_tx_hash = $2,
+                 dest_block = COALESCE($3, dest_block),
+                 finalized_at = $4,
+                 updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(payout_txid)
+        .bind(payout_block)
+        .bind(finalized_at)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
     /// List transfers, most recent first.
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<TunnelTransferRow>> {
         let rows = sqlx::query_as::<_, TunnelTransferRow>(

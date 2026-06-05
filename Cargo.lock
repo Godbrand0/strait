@@ -4603,6 +4603,9 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "bigdecimal",
+ "chrono",
+ "hex",
  "strait-api",
  "strait-bitcoin",
  "strait-core",

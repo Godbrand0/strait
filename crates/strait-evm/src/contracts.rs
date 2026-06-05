@@ -621,4 +621,27 @@ mod tests {
         assert!(txid_to_bytes32("invalid").is_err());
         assert!(txid_to_bytes32("0123456789abcdef").is_err()); // too short
     }
+
+    #[test]
+    fn test_recover_btc_address_from_initiate_withdrawal_calldata() {
+        use alloy::sol_types::SolCall;
+        // Real Hemi-mainnet initiateWithdrawal(uint32,string,uint256) calldata.
+        // The btcAddress is `indexed` (keccak-hashed) in the WithdrawalInitiated event,
+        // but the originating call carries it in cleartext — this proves we can recover it.
+        let calldata = hex::decode(concat!(
+            "6fff6d2e",
+            "0000000000000000000000000000000000000000000000000000000000000006",
+            "0000000000000000000000000000000000000000000000000000000000000060",
+            "00000000000000000000000000000000000000000000000000000000000927c0",
+            "000000000000000000000000000000000000000000000000000000000000002a",
+            "6263317177716c3261756a32753536736b38376e327038673436346e6e737770",
+            "367161726b637935746b00000000000000000000000000000000000000000000",
+        ))
+        .unwrap();
+        let decoded =
+            IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(&calldata, false).unwrap();
+        assert_eq!(decoded.vaultIndex, 6);
+        assert_eq!(decoded.btcAddress, "bc1qwql2auj2u56sk87n2p8g464nnswp6qarkcy5tk");
+        assert_eq!(decoded.amount, alloy::primitives::U256::from(600_000u64));
+    }
 }

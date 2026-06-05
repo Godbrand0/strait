@@ -14,6 +14,8 @@
 //!                          HTTP API (axum) ── /health, /transfers
 //! ```
 
+mod payout_watcher;
+
 use std::sync::Arc;
 
 use alloy::providers::{Provider, ProviderBuilder};
@@ -70,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // Clone the Hemi provider first — the Bitcoin watcher reads Bitcoin state
     // through the BitcoinKit precompile on Hemi using the same RPC.
     let bitcoin_kit_provider = hemi_provider.clone();
+    let payout_kit_provider = hemi_provider.clone();
     let hemi_ingester = EvmIngester::new(
         config.hemi.clone(),
         Chain::Hemi,
@@ -111,6 +114,21 @@ async fn main() -> anyhow::Result<()> {
         tasks.spawn(async move {
             if let Err(e) = btc_ingester.run().await {
                 error!("Bitcoin ingester exited: {e}");
+            }
+        });
+    }
+    // Bitcoin payout watcher — finalizes Hemi→BTC withdrawals once their payout is
+    // observed. Runs unconditionally (it reads recipients from the DB; no custody
+    // addresses needed) and reads Bitcoin state through BitcoinKit on Hemi.
+    {
+        let caller = build_bitcoin_kit_caller(&config, payout_kit_provider);
+        let db = db.clone();
+        let interval = config.bitcoin.poll_interval_secs;
+        let confs = config.bitcoin.confirmation_depth;
+        tasks.spawn(async move {
+            let watcher = payout_watcher::BtcPayoutWatcher::new(caller, db, interval, confs);
+            if let Err(e) = watcher.run().await {
+                error!("BTC payout watcher exited: {e}");
             }
         });
     }
@@ -181,23 +199,7 @@ fn build_bitcoin_ingester(
         return None;
     }
 
-    let caller = match config
-        .hemi
-        .bitcoin_kit_contract
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(addr) => BitcoinKitCaller::new(hemi_provider, addr),
-        None => {
-            // Fall back to the well-known address for the configured Hemi chain.
-            if config.hemi.chain_id == 743111 {
-                BitcoinKitCaller::testnet(hemi_provider)
-            } else {
-                BitcoinKitCaller::mainnet(hemi_provider)
-            }
-        }
-    };
-
+    let caller = build_bitcoin_kit_caller(config, hemi_provider);
     let watcher = CustodyWatcher::new(caller, config.bitcoin.tunnel_addresses.clone());
     info!(
         addresses = config.bitcoin.tunnel_addresses.len(),
@@ -208,6 +210,21 @@ fn build_bitcoin_ingester(
         event_tx,
         config.bitcoin.poll_interval_secs,
     ))
+}
+
+/// Resolve the BitcoinKit precompile caller for the configured Hemi chain, using
+/// `HEMI_BITCOIN_KIT_CONTRACT` if set, else the well-known mainnet/testnet address.
+fn build_bitcoin_kit_caller(config: &AppConfig, hemi_provider: Arc<dyn Provider>) -> BitcoinKitCaller {
+    match config
+        .hemi
+        .bitcoin_kit_contract
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(addr) => BitcoinKitCaller::new(hemi_provider, addr),
+        None if config.hemi.chain_id == 743111 => BitcoinKitCaller::testnet(hemi_provider),
+        None => BitcoinKitCaller::mainnet(hemi_provider),
+    }
 }
 
 /// Build a read-only HTTP JSON-RPC provider for an EVM chain.

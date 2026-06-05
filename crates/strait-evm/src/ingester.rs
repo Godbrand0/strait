@@ -9,11 +9,12 @@ use std::time::Duration;
 use alloy::primitives::{Address as AlloyAddress, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use std::collections::BTreeMap;
 use tracing::{debug, error, info, instrument, warn};
 
 use strait_core::{
@@ -149,47 +150,77 @@ impl EvmIngester {
             return Err(StraitError::Chain(format!("Reorg detected at block {}", *last_block)));
         }
         
-        // Process blocks one at a time
+        // Scan in windows: one get_logs call covers up to LOG_RANGE blocks, and we only
+        // fetch block headers for the (few) blocks that actually carry tunnel events.
+        // This keeps RPC usage far below per-block scanning — important on rate-limited
+        // public endpoints — and we checkpoint once per window (re-processing a window
+        // after a crash is harmless, as all writes are idempotent upserts).
+        const LOG_RANGE: u64 = 100;
         let mut new_last = *last_block;
-        for block_num in (*last_block + 1)..=confirmed {
-            self.process_block(block_num).await?;
-            new_last = block_num;
+        while new_last < confirmed {
+            let from = new_last + 1;
+            let to = (from + LOG_RANGE - 1).min(confirmed);
+            let to_hash = self.process_block_range(from, to).await?;
+            self.save_checkpoint(to, to_hash).await?;
+            new_last = to;
         }
-        
+
+        // Heartbeat so a caught-up node is visibly alive (range scanning is otherwise
+        // silent for blocks with no tunnel events).
+        info!("indexed up to block {} (chain tip {})", new_last, latest);
         Ok(new_last)
     }
 
-    /// Process a single block for tunnel events.
-    #[instrument(skip(self), fields(block = block_num))]
-    async fn process_block(&self, block_num: u64) -> Result<()> {
-        debug!("Processing block {}", block_num);
-        
-        // Get block with timestamp
+    /// Scan a window of blocks `[from, to]` with a single get_logs call, process any
+    /// tunnel events in chain order, and return the hash of block `to` (for the checkpoint).
+    #[instrument(skip(self), fields(from = from, to = to))]
+    async fn process_block_range(&self, from: u64, to: u64) -> Result<B256> {
+        let mut logs = self.get_tunnel_logs(from, to).await?;
+        // get_logs returns in chain order, but sort defensively before processing.
+        logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
+        if !logs.is_empty() {
+            info!("found {} tunnel event(s) in blocks {}-{}", logs.len(), from, to);
+        }
+
+        // Fetch each relevant block's header once (timestamp + hash). Most blocks in the
+        // window carry no tunnel events, so this is a handful of calls, not one per block.
+        let mut headers: BTreeMap<u64, (B256, DateTime<Utc>)> = BTreeMap::new();
+        for log in &logs {
+            let bn = log.block_number.unwrap_or(0);
+            if let std::collections::btree_map::Entry::Vacant(e) = headers.entry(bn) {
+                e.insert(self.fetch_block_header(bn).await?);
+            }
+        }
+
+        for log in logs {
+            let bn = log.block_number.unwrap_or(0);
+            let (block_hash, block_time) =
+                headers.get(&bn).copied().unwrap_or((B256::ZERO, Utc::now()));
+            self.process_log(log, bn, block_hash, block_time).await?;
+        }
+
+        // The checkpoint needs the hash of `to`; reuse it if it carried events, else fetch.
+        match headers.get(&to) {
+            Some((hash, _)) => Ok(*hash),
+            None => Ok(self.fetch_block_header(to).await?.0),
+        }
+    }
+
+    /// Fetch a single block's hash and timestamp.
+    async fn fetch_block_header(&self, block_num: u64) -> Result<(B256, DateTime<Utc>)> {
         let block = self.provider
             .get_block_by_number(block_num.into(), false)
             .await
             .map_err(|e| StraitError::EvmProvider(format!("Failed to get block: {}", e)))?
             .ok_or_else(|| StraitError::EvmProvider(format!("Block {} not found", block_num)))?;
-        
-        let block_hash = block.header.hash;
-        let block_time = DateTime::from_timestamp(block.header.timestamp as i64, 0)
+        let hash = block.header.hash;
+        let time = DateTime::from_timestamp(block.header.timestamp as i64, 0)
             .unwrap_or_else(Utc::now);
-        
-        // Get logs for tunnel contract
-        let logs = self.get_tunnel_logs(block_num).await?;
-
-        for log in logs {
-            self.process_log(log, block_num, block_hash, block_time).await?;
-        }
-
-        // Persist progress so a restart resumes after this block.
-        self.save_checkpoint(block_num, block_hash).await?;
-
-        Ok(())
+        Ok((hash, time))
     }
 
-    /// Get logs from the tunnel contract for a specific block.
-    async fn get_tunnel_logs(&self, block_num: u64) -> Result<Vec<Log>> {
+    /// Get tunnel-contract logs across a window of blocks `[from_block, to_block]`.
+    async fn get_tunnel_logs(&self, from_block: u64, to_block: u64) -> Result<Vec<Log>> {
         // Watch the ETH/ERC-20 tunnel (L2StandardBridge / L1 bridge) and, on Hemi,
         // the BTC tunnel (BitcoinTunnelManager) — DepositConfirmed / WithdrawalInitiated
         // for BTC routes are emitted there, not on the standard bridge.
@@ -209,8 +240,8 @@ impl EvmIngester {
 
         let filter = alloy::rpc::types::Filter::new()
             .address(addresses)
-            .from_block(block_num)
-            .to_block(block_num);
+            .from_block(from_block)
+            .to_block(to_block);
         
         let logs = self.provider
             .get_logs(&filter)
@@ -575,10 +606,20 @@ impl EvmIngester {
         block_num: u64,
         log_index: u32,
     ) -> Result<()> {
+        // The btcAddress is `indexed` in the event (only a keccak hash survives in the
+        // topic), but the originating initiateWithdrawal(uint32,string,uint256) call
+        // carries it in cleartext — recover it from the transaction calldata so the
+        // transfer has the real Bitcoin recipient (and the Bitcoin payout can be matched).
+        let destination = match self.recover_withdrawal_btc_address(tx_hash).await {
+            Some(addr) => ChainAddress::Bitcoin(BitcoinAddress::new(addr)),
+            None => ChainAddress::Bitcoin(BitcoinAddress::new(format!("withdrawal-uuid-{uuid}"))),
+        };
+
         info!(
             withdrawer = %hex::encode(withdrawer.0),
             %net_sats,
             uuid,
+            recipient = ?destination,
             "WithdrawalInitiated — hBTC burned, BTC payout registered"
         );
         let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
@@ -586,14 +627,23 @@ impl EvmIngester {
             asset: Asset::Btc,
             amount: u256_to_bigdecimal(net_sats)?,
             from: withdrawer,
-            // btcAddress is not recoverable from an indexed string topic.
-            // The bitcoin address will be resolved by watching the payout tx on Bitcoin.
-            destination: ChainAddress::Bitcoin(BitcoinAddress::new(format!("withdrawal-uuid-{uuid}"))),
+            destination,
             block_number: block_num,
             log_index,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
+    }
+
+    /// Recover the plaintext BTC withdrawal address from the originating
+    /// `initiateWithdrawal` transaction's calldata. Returns `None` if the tx can't
+    /// be fetched or its calldata isn't a recognised `initiateWithdrawal` call.
+    async fn recover_withdrawal_btc_address(&self, tx_hash: B256) -> Option<String> {
+        let tx = self.provider.get_transaction_by_hash(tx_hash).await.ok()??;
+        let decoded =
+            IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(tx.input.as_ref(), false)
+                .ok()?;
+        Some(decoded.btcAddress)
     }
 }
 
