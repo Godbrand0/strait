@@ -265,7 +265,8 @@ impl Default for TransferState {
 mod tests {
     use super::*;
     use strait_core::types::{
-        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TxHash,
+        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TunnelDirection,
+        TunnelRoute, TxHash,
     };
     use chrono::Utc;
 

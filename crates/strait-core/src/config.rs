@@ -42,10 +42,13 @@ pub struct EvmChainConfig {
     pub rpc_url: String,
     /// Chain ID (43111 for Hemi mainnet, 743111 for Hemi testnet, 1 for Ethereum mainnet, 11155111 for Sepolia)
     pub chain_id: u64,
-    /// Tunnel contract address (checksummed).
-    /// For ETH/ERC-20 routes: L2StandardBridge (0x4200000000000000000000000000000000000010 on Hemi).
-    /// For BTC routes: the Hemi Bitcoin tunnel contract (address TBC — FIXME: confirm with Hemi docs).
+    /// ETH/ERC-20 tunnel contract — L2StandardBridge (0x4200…0010 on Hemi),
+    /// L1StandardBridgeProxy on Ethereum.
     pub tunnel_contract: String,
+    /// BTC tunnel contract — BitcoinTunnelManager on Hemi (emits DepositConfirmed /
+    /// WithdrawalInitiated). Watched in addition to `tunnel_contract`. None on Ethereum.
+    #[serde(default)]
+    pub btc_tunnel_contract: Option<String>,
     /// BitcoinKit precompile address on Hemi.
     /// Mainnet: 0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12 (v1)
     /// Testnet: 0xeC9fa5daC1118963933e1A675a4EEA0009b7f215 (v0)
@@ -213,6 +216,7 @@ impl AppConfig {
                 rpc_url: env_str("HEMI_RPC_URL"),
                 chain_id: env_parse("HEMI_CHAIN_ID", 43111),
                 tunnel_contract: env_str("HEMI_TUNNEL_CONTRACT"),
+                btc_tunnel_contract: env_opt("HEMI_BTC_TUNNEL_CONTRACT"),
                 bitcoin_kit_contract: env_opt("HEMI_BITCOIN_KIT_CONTRACT"),
                 start_block: env_parse("HEMI_START_BLOCK", default_start_block()),
                 confirmation_depth: env_parse(
@@ -225,6 +229,7 @@ impl AppConfig {
                 rpc_url: env_str("ETH_RPC_URL"),
                 chain_id: env_parse("ETH_CHAIN_ID", 1),
                 tunnel_contract: env_str("ETH_TUNNEL_CONTRACT"),
+                btc_tunnel_contract: None,
                 bitcoin_kit_contract: None,
                 start_block: env_parse("ETH_START_BLOCK", default_start_block()),
                 confirmation_depth: env_parse(
@@ -331,6 +336,7 @@ mod tests {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
                 chain_id: 743111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                btc_tunnel_contract: Some("0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e".to_string()),
                 bitcoin_kit_contract: Some("0xeC9fa5daC1118963933e1A675a4EEA0009b7f215".to_string()),
                 start_block: 0,
                 confirmation_depth: 3,
@@ -340,6 +346,7 @@ mod tests {
                 rpc_url: "https://eth-sepolia.g.alchemy.com/v2/test".to_string(),
                 chain_id: 11155111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                btc_tunnel_contract: None,
                 bitcoin_kit_contract: None,
                 start_block: 0,
                 confirmation_depth: 12,

@@ -190,12 +190,25 @@ impl EvmIngester {
 
     /// Get logs from the tunnel contract for a specific block.
     async fn get_tunnel_logs(&self, block_num: u64) -> Result<Vec<Log>> {
-        // Parse the tunnel contract address from hex string
-        let tunnel_address: AlloyAddress = self.config.tunnel_contract.parse()
-            .map_err(|e| StraitError::Parse(format!("Invalid tunnel contract address: {}", e)))?;
-        
+        // Watch the ETH/ERC-20 tunnel (L2StandardBridge / L1 bridge) and, on Hemi,
+        // the BTC tunnel (BitcoinTunnelManager) — DepositConfirmed / WithdrawalInitiated
+        // for BTC routes are emitted there, not on the standard bridge.
+        let mut addresses: Vec<AlloyAddress> = Vec::with_capacity(2);
+        addresses.push(
+            self.config.tunnel_contract.parse().map_err(|e| {
+                StraitError::Parse(format!("Invalid tunnel contract address: {}", e))
+            })?,
+        );
+        if let Some(btc) = self.config.btc_tunnel_contract.as_deref() {
+            if !btc.is_empty() {
+                addresses.push(btc.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid BTC tunnel contract address: {}", e))
+                })?);
+            }
+        }
+
         let filter = alloy::rpc::types::Filter::new()
-            .address(tunnel_address)
+            .address(addresses)
             .from_block(block_num)
             .to_block(block_num);
         

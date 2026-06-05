@@ -397,7 +397,7 @@ mod tests {
     use chrono::Utc;
     use strait_core::{
         events::BitcoinEvent,
-        types::{Asset, BitcoinAddress, BitcoinTxid, BlockHash, TxHash},
+        types::{Address, Asset, BitcoinAddress, BitcoinTxid, BlockHash, TxHash},
     };
 
     fn make_btc_deposit(txid_bytes: [u8; 32], addr: &str, amount_sats: u64) -> RawEvent {
