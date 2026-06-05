@@ -4,9 +4,11 @@ import {
   formatAmount,
   routeLabel,
   statusStyle,
+  transferKind,
   shortHash,
   timeAgo,
   txExplorerUrl,
+  sourceObserved,
   type Transfer,
 } from "@/lib/strait";
 
@@ -32,6 +34,7 @@ export default async function TransferDetailPage({
   if (!t) return <NotFound id={id} />;
 
   const s = statusStyle(t.status);
+  const kind = transferKind(t.direction);
   const steps = buildTimeline(t);
 
   return (
@@ -43,8 +46,11 @@ export default async function TransferDetailPage({
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <div className="font-mono text-2xl font-semibold tracking-tight">
-            {routeLabel(t.route)}
+          <div className="flex items-center gap-3">
+            <span className="font-mono text-2xl font-semibold tracking-tight">
+              {routeLabel(t.route)}
+            </span>
+            <span className={`rounded border px-2 py-0.5 text-xs ${kind.cls}`}>{kind.label}</span>
           </div>
           <div className="mt-1 text-3xl font-semibold tabular-nums text-white">
             {formatAmount(t.asset, t.amount)}
@@ -84,12 +90,17 @@ export default async function TransferDetailPage({
           <h2 className="mb-5 text-sm font-medium text-zinc-300">Details</h2>
           <dl className="space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-5 py-4 text-sm">
             <Field label="Asset" value={t.asset} />
-            <Field label="Direction" value={t.direction === "IN" ? "Into Hemi" : "Out of Hemi"} />
+            <Field label="Direction" value={`${kind.label} (${kind.hint})`} />
             <Field label="Amount" value={formatAmount(t.asset, t.amount)} mono />
             <Field label="Sender" value={shortHash(t.sender)} mono />
             <Field label="Recipient" value={shortHash(t.recipient)} mono />
             <div className="h-px bg-white/[0.06]" />
-            <TxField label="Source" chain={t.sourceChain} hash={t.sourceTxHash} block={t.sourceBlock} />
+            <TxField
+              label="Source"
+              chain={t.sourceChain}
+              hash={sourceObserved(t) ? t.sourceTxHash : null}
+              block={sourceObserved(t) ? t.sourceBlock : null}
+            />
             <TxField label="Destination" chain={t.destChain} hash={t.destTxHash} block={t.destBlock} />
             <div className="h-px bg-white/[0.06]" />
             <Field label="Initiated" value={timeAgo(t.initiatedAt)} />
@@ -104,50 +115,63 @@ export default async function TransferDetailPage({
 function buildTimeline(t: Transfer): Step[] {
   const inbound = t.direction === "IN";
   const failed = t.status === "FAILED" || t.status === "REORGED";
+  // PoP / Bitcoin-anchoring only applies to BTC routes. ETH/ERC-20 routes go
+  // straight from initiation to finalization — no keystone step.
+  const isBtcRoute = t.route === "BTC_TO_HEMI" || t.route === "HEMI_TO_BTC";
+
+  const popStep: Step = {
+    title: "Anchored to Bitcoin (PoP)",
+    chain: null,
+    hash: null,
+    block: t.popKeystoneBlock,
+    done: t.popAnchored,
+    detail: t.popAnchored ? `keystone #${t.popKeystoneBlock?.toLocaleString()}` : "awaiting keystone",
+  };
+  const finalStep: Step = {
+    title: failed ? "Failed" : "Finalized",
+    chain: null,
+    hash: null,
+    block: null,
+    done: t.status === "FINALIZED" || failed,
+  };
 
   if (inbound) {
-    const srcLabel = t.sourceChain === "BITCOIN" ? "Bitcoin deposit confirmed" : "Locked on source chain";
-    return [
-      { title: srcLabel, chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true },
+    const srcObs = sourceObserved(t);
+    const srcLabel = t.sourceChain === "BITCOIN"
+      ? "Bitcoin deposit confirmed"
+      : srcObs
+        ? "Locked on source chain"
+        : "Locked on Ethereum (L1)";
+    const steps: Step[] = [
       {
-        title: "Minted on Hemi",
-        chain: t.destChain,
-        hash: t.destTxHash,
-        block: t.destBlock,
-        done: t.destTxHash != null,
+        title: srcLabel,
+        chain: srcObs ? t.sourceChain : null,
+        hash: srcObs ? t.sourceTxHash : null,
+        block: srcObs ? t.sourceBlock || null : null,
+        done: srcObs,
+        detail: srcObs ? undefined : "L1 deposit not yet matched",
       },
-      {
-        title: "Anchored to Bitcoin (PoP)",
-        chain: null,
-        hash: null,
-        block: t.popKeystoneBlock,
-        done: t.popAnchored,
-        detail: t.popAnchored ? `keystone #${t.popKeystoneBlock?.toLocaleString()}` : "awaiting keystone",
-      },
-      { title: failed ? "Failed" : "Finalized", chain: null, hash: null, block: null, done: t.status === "FINALIZED" || failed },
+      { title: "Minted on Hemi", chain: t.destChain, hash: t.destTxHash, block: t.destBlock, done: t.destTxHash != null },
     ];
+    if (isBtcRoute) steps.push(popStep);
+    steps.push(finalStep);
+    return steps;
   }
 
   // Outbound (withdrawal from Hemi)
-  return [
+  const steps: Step[] = [
     { title: "Burned on Hemi", chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true },
-    {
-      title: "Anchored to Bitcoin (PoP)",
-      chain: null,
-      hash: null,
-      block: t.popKeystoneBlock,
-      done: t.popAnchored,
-      detail: t.popAnchored ? `keystone #${t.popKeystoneBlock?.toLocaleString()}` : "awaiting keystone",
-    },
-    {
-      title: t.destChain === "BITCOIN" ? "Paid out on Bitcoin" : "Released on destination",
-      chain: t.destChain,
-      hash: t.destTxHash,
-      block: t.destBlock,
-      done: t.destTxHash != null,
-    },
-    { title: failed ? "Failed" : "Finalized", chain: null, hash: null, block: null, done: t.status === "FINALIZED" || failed },
   ];
+  if (isBtcRoute) steps.push(popStep);
+  steps.push({
+    title: t.destChain === "BITCOIN" ? "Paid out on Bitcoin" : "Released on destination",
+    chain: t.destChain,
+    hash: t.destTxHash,
+    block: t.destBlock,
+    done: t.destTxHash != null,
+  });
+  steps.push(finalStep);
+  return steps;
 }
 
 function TimelineStep({ step, last }: { step: Step; last: boolean }) {

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import AutoRefresh from "./AutoRefresh";
 
 export default function DashboardLayout({
   children,
@@ -7,6 +8,7 @@ export default function DashboardLayout({
 }) {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans">
+      <AutoRefresh seconds={10} />
       <header className="sticky top-0 z-50 border-b border-white/[0.06] bg-[#0a0a0a]/80 backdrop-blur-md">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-6">
@@ -19,7 +21,7 @@ export default function DashboardLayout({
             </Link>
           </div>
           <div className="flex items-center gap-3 text-sm">
-            <span className="inline-flex items-center gap-2 text-zinc-400">
+            <span className="inline-flex items-center gap-2 text-zinc-400" title="Auto-refreshes every 10s">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
               live
             </span>

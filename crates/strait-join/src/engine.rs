@@ -442,6 +442,14 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                 None => deterministic_id(tx_hash, *log_index),
             };
 
+            // An ETH/ERC-20 deposit finalizing on Hemi means the funds have arrived —
+            // the transfer is complete. A BTC mint is only INITIATED until a PoP
+            // keystone anchors it to Bitcoin.
+            let (status, finalized_at) = match route {
+                TunnelRoute::EthToHemi => (TunnelStatus::Finalized, Some(now)),
+                _ => (TunnelStatus::Initiated, None),
+            };
+
             Some(TunnelTransfer {
                 id,
                 asset: asset.clone(),
@@ -450,9 +458,9 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                 amount: amount.clone(),
                 sender,
                 recipient: ChainAddress::Evm(Address(to.0)),
-                status: TunnelStatus::Initiated,
+                status,
                 initiated_at: now,
-                finalized_at: None,
+                finalized_at,
                 source_tx: ChainTransaction {
                     chain: source_chain,
                     hash: source_hash,
@@ -677,7 +685,9 @@ mod tests {
             t.recipient,
             ChainAddress::Evm(Address::from_hex(REAL_TO).unwrap())
         );
-        assert!(matches!(t.status, TunnelStatus::Initiated));
+        // An ETH/ERC-20 deposit finalizing on Hemi is complete.
+        assert!(matches!(t.status, TunnelStatus::Finalized));
+        assert!(t.finalized_at.is_some());
         let dest = t.destination_tx.as_ref().expect("mint records a Hemi dest tx");
         assert_eq!(dest.chain, Chain::Hemi);
         assert_eq!(dest.block_number, REAL_BLOCK);
@@ -689,17 +699,28 @@ mod tests {
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(32);
         let handle = tokio::spawn(JoinEngine::new(event_rx, update_tx).run());
 
-        // 1. The real bridge event arrives → engine emits Created.
-        event_tx.send(real_mint_event()).await.unwrap();
+        // 1. A BTC→Hemi mint at the real testnet block → engine emits Created (INITIATED).
+        //    PoP anchoring applies to BTC routes (ETH routes finalize immediately).
+        event_tx
+            .send(RawEvent::Hemi(HemiEvent::TunnelMint {
+                tx_hash: TxHash::from_hex(REAL_TX).unwrap(),
+                asset: strait_core::types::Asset::Btc,
+                amount: bigdecimal::BigDecimal::from(REAL_AMOUNT),
+                to: Address::from_hex(REAL_TO).unwrap(),
+                source_txid: Some(BitcoinTxid([3u8; 32])),
+                block_number: REAL_BLOCK,
+                log_index: 1,
+            }))
+            .await
+            .unwrap();
         let id = match update_rx.recv().await.unwrap() {
             TunnelTransferUpdate::Created(t) => {
-                assert_eq!(t.route, TunnelRoute::EthToHemi);
-                assert_eq!(t.amount, bigdecimal::BigDecimal::from(REAL_AMOUNT));
+                assert_eq!(t.route, TunnelRoute::BtcToHemi);
+                assert!(matches!(t.status, TunnelStatus::Initiated));
                 t.id
             }
             other => panic!("expected Created, got {other:?}"),
         };
-        assert_eq!(id, uuid::Uuid::parse_str(REAL_ID).unwrap());
 
         // 2. The keystone covering block 6037628 fires → PoP anchored on Bitcoin.
         event_tx

@@ -3,14 +3,14 @@
 export const STRAIT_API_URL =
   process.env.STRAIT_API_URL ?? "http://localhost:8080/graphql";
 
-// Block-explorer bases (testnet defaults; override via env). Used to link out
-// to the canonical chain explorers from a transfer's source/destination tx.
+// Block-explorer bases. Default to mainnet (the node's default target); override
+// via env for testnet, e.g. NEXT_PUBLIC_HEMI_EXPLORER=https://testnet.explorer.hemi.xyz
 const HEMI_EXPLORER =
-  process.env.NEXT_PUBLIC_HEMI_EXPLORER ?? "https://testnet.explorer.hemi.xyz";
+  process.env.NEXT_PUBLIC_HEMI_EXPLORER ?? "https://explorer.hemi.xyz";
 const BTC_EXPLORER =
-  process.env.NEXT_PUBLIC_BTC_EXPLORER ?? "https://mempool.space/testnet";
+  process.env.NEXT_PUBLIC_BTC_EXPLORER ?? "https://mempool.space";
 const ETH_EXPLORER =
-  process.env.NEXT_PUBLIC_ETH_EXPLORER ?? "https://sepolia.etherscan.io";
+  process.env.NEXT_PUBLIC_ETH_EXPLORER ?? "https://etherscan.io";
 
 export type Transfer = {
   id: string;
@@ -111,6 +111,13 @@ export function statusStyle(status: string): { dot: string; text: string; label:
   }
 }
 
+/** Deposit (into Hemi) vs Withdrawal (out of Hemi), from the transfer direction. */
+export function transferKind(direction: string): { label: string; hint: string; cls: string } {
+  return direction === "OUT"
+    ? { label: "Withdrawal", hint: "out of Hemi", cls: "text-sky-300 border-sky-400/30" }
+    : { label: "Deposit", hint: "into Hemi", cls: "text-violet-300 border-violet-400/30" };
+}
+
 export function routeLabel(route: string): string {
   const map: Record<string, string> = {
     BTC_TO_HEMI: "BTC → Hemi",
@@ -161,6 +168,14 @@ export function timeAgo(iso: string | null | undefined): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+/** Whether the source leg is a real, observed transaction. BTC carries a real
+ *  txid; an EVM source is only real once we've seen its block. ETH→Hemi currently
+ *  mirrors the Hemi mint hash as a placeholder until the L1 deposit is matched,
+ *  so a zero source block means "not yet observed" — don't link it. */
+export function sourceObserved(t: Transfer): boolean {
+  return t.sourceChain === "BITCOIN" || t.sourceBlock > 0;
 }
 
 /** Build an explorer link for a tx on a given chain ("BITCOIN" | "HEMI" | "ETHEREUM"). */

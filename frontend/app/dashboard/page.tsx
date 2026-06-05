@@ -1,14 +1,10 @@
-import Link from "next/link";
 import {
   getOverview,
-  formatAmount,
-  routeLabel,
   statusStyle,
-  shortHash,
-  timeAgo,
   STATUSES,
   type Transfer,
 } from "@/lib/strait";
+import TransferRow from "./TransferRow";
 
 export const dynamic = "force-dynamic";
 
@@ -61,7 +57,7 @@ export default async function DashboardPage() {
                   <th className="font-medium px-4 py-3">Status</th>
                   <th className="font-medium px-4 py-3">Bitcoin-final</th>
                   <th className="font-medium px-4 py-3">Recipient</th>
-                  <th className="font-medium px-4 py-3 text-right">Age</th>
+                  <th className="font-medium px-4 py-3 text-right">Age →</th>
                 </tr>
               </thead>
               <tbody>
@@ -127,35 +123,6 @@ function StatusFunnel({ counts, total }: { counts: Record<string, number>; total
         ))}
       </div>
     </div>
-  );
-}
-
-function TransferRow({ t }: { t: Transfer }) {
-  const s = statusStyle(t.status);
-  return (
-    <tr className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02] transition-colors">
-      <td className="px-4 py-3">
-        <Link href={`/dashboard/transfers/${t.id}`} className="font-mono text-zinc-200 hover:text-orange-400">
-          {routeLabel(t.route)}
-        </Link>
-      </td>
-      <td className="px-4 py-3 tabular-nums text-zinc-200">{formatAmount(t.asset, t.amount)}</td>
-      <td className="px-4 py-3">
-        <span className={`inline-flex items-center gap-1.5 ${s.text}`}>
-          <span className={`h-2 w-2 rounded-full ${s.dot}`} />
-          {s.label}
-        </span>
-      </td>
-      <td className="px-4 py-3">
-        {t.popAnchored ? (
-          <span className="text-emerald-300">✓ anchored</span>
-        ) : (
-          <span className="text-zinc-600">pending</span>
-        )}
-      </td>
-      <td className="px-4 py-3 font-mono text-zinc-400">{shortHash(t.recipient)}</td>
-      <td className="px-4 py-3 text-right text-zinc-500">{timeAgo(t.initiatedAt)}</td>
-    </tr>
   );
 }
 
