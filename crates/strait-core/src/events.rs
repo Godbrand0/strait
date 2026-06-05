@@ -176,6 +176,8 @@ pub enum EthereumEvent {
         from: Address,
         block_number: u64,
         log_index: u32,
+        /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A tunnel release (assets released from Hemi to Ethereum)
     TunnelRelease {
@@ -185,6 +187,8 @@ pub enum EthereumEvent {
         to: Address,
         block_number: u64,
         log_index: u32,
+        /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A chain reorganization was detected
     BlockReorg {

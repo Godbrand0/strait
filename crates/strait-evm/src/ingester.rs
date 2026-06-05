@@ -20,7 +20,7 @@ use tracing::{debug, error, info, instrument, warn};
 use strait_core::{
     config::EvmChainConfig,
     error::{Result, StraitError},
-    events::{RawEvent, HemiEvent},
+    events::{RawEvent, HemiEvent, EthereumEvent},
     types::{Address, Asset, BitcoinTxid, Chain, ChainAddress, BitcoinAddress, TxHash},
 };
 use strait_store::{CheckpointRepo, Database, UpsertCheckpoint};
@@ -433,16 +433,31 @@ impl EvmIngester {
         log_index: u32,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeFinalized (deposit on Hemi)");
-        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Eth,
-            amount: u256_to_bigdecimal(amount)?,
-            to,
-            source_txid: None,
-            block_number: block_num,
-            log_index,
-            gas_fee: self.fetch_gas_fee(tx_hash).await,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, a "finalized" bridge event is a withdrawal released to the user.
+            RawEvent::Ethereum(EthereumEvent::TunnelRelease {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                to,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelMint {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                to,
+                source_txid: None,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -457,16 +472,31 @@ impl EvmIngester {
         log_index: u32,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeInitiated (withdrawal from Hemi)");
-        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Eth,
-            amount: u256_to_bigdecimal(amount)?,
-            from,
-            destination: ChainAddress::Evm(to),
-            block_number: block_num,
-            log_index,
-            gas_fee: self.fetch_gas_fee(tx_hash).await,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, an "initiated" bridge event is a deposit being locked for L2.
+            RawEvent::Ethereum(EthereumEvent::TunnelLock {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                from,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelBurn {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                from,
+                destination: ChainAddress::Evm(to),
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -489,20 +519,32 @@ impl EvmIngester {
             %amount,
             "ERC20BridgeFinalized (deposit on Hemi)"
         );
-        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Erc20 {
-                contract: local_token,
-                symbol: String::new(),  // resolved off the token-list if needed
-                decimals: 18,
-            },
-            amount: u256_to_bigdecimal(amount)?,
-            to,
-            source_txid: None,
-            block_number: block_num,
-            log_index,
-            gas_fee: self.fetch_gas_fee(tx_hash).await,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, a "finalized" bridge event is a withdrawal released to the user.
+            RawEvent::Ethereum(EthereumEvent::TunnelRelease {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                to,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelMint {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                to,
+                source_txid: None,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -525,20 +567,32 @@ impl EvmIngester {
             %amount,
             "ERC20BridgeInitiated (withdrawal from Hemi)"
         );
-        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Erc20 {
-                contract: local_token,
-                symbol: String::new(),
-                decimals: 18,
-            },
-            amount: u256_to_bigdecimal(amount)?,
-            from,
-            destination: ChainAddress::Evm(to),
-            block_number: block_num,
-            log_index,
-            gas_fee: self.fetch_gas_fee(tx_hash).await,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, an "initiated" bridge event is a deposit being locked for L2.
+            RawEvent::Ethereum(EthereumEvent::TunnelLock {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                from,
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelBurn {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                from,
+                destination: ChainAddress::Evm(to),
+                block_number: block_num,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }

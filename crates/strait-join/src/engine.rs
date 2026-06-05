@@ -154,9 +154,26 @@ impl JoinEngine {
             // ingester. The matcher (below) handles cross-chain enrichment once
             // BitcoinEvent / EthereumEvent source legs are produced.
             RawEvent::Hemi(HemiEvent::TunnelMint { .. } | HemiEvent::TunnelBurn { .. }) => {
+                // Only ETH-route legs need the matcher (BTC routes converge via their
+                // txid on the direct path). Feeding BTC mints here would leave them
+                // pending forever, so gate on the ETH-route shape.
+                let eth_route = matches!(
+                    &event,
+                    RawEvent::Hemi(HemiEvent::TunnelMint { source_txid: None, .. })
+                        | RawEvent::Hemi(HemiEvent::TunnelBurn {
+                            destination: ChainAddress::Evm(_),
+                            ..
+                        })
+                );
                 if let RawEvent::Hemi(hemi) = &event {
                     if let Some(transfer) = transfer_from_hemi_event(hemi) {
                         self.register_transfer(transfer).await?;
+                    }
+                }
+                // Feed the matcher so a later Ethereum L1 leg enriches this transfer.
+                if eth_route {
+                    if let Some(m) = self.matcher.process_event(event) {
+                        self.handle_match(m).await?;
                     }
                 }
             }
@@ -253,19 +270,24 @@ impl JoinEngine {
     async fn handle_match(&mut self, m: crate::matcher::MatchResult) -> Result<()> {
         debug!(direction = ?m.direction, amount = m.amount, "Cross-chain match found");
 
-        // The Hemi leg of the match is the authoritative transfer record. Materialize
-        // it (deduplicated by deterministic id inside `register_transfer`). Once the
-        // source-side ingesters come online, this is where the Bitcoin/Ethereum source
-        // tx would additionally enrich the record.
-        for ev in [&m.source, &m.destination] {
-            if let RawEvent::Hemi(hemi) = ev {
-                if let Some(transfer) = transfer_from_hemi_event(hemi) {
-                    self.register_transfer(transfer).await?;
-                }
-            }
-        }
+        // The Hemi leg is the authoritative transfer record (deduplicated by
+        // deterministic id in `register_transfer`); the matched Ethereum leg enriches
+        // it with the real L1 source (deposits) or release (withdrawals).
+        let hemi = [&m.source, &m.destination].into_iter().find_map(|e| match e {
+            RawEvent::Hemi(h) => Some(h),
+            _ => None,
+        });
+        let eth = [&m.source, &m.destination].into_iter().find_map(|e| match e {
+            RawEvent::Ethereum(x) => Some(x),
+            _ => None,
+        });
 
-        Ok(())
+        let Some(hemi) = hemi else { return Ok(()); };
+        let Some(mut transfer) = transfer_from_hemi_event(hemi) else { return Ok(()); };
+        if let Some(eth) = eth {
+            enrich_with_eth_leg(&mut transfer, eth);
+        }
+        self.register_transfer(transfer).await
     }
 
     /// Insert (or refresh) a transfer in state and emit a `Created` update for the
@@ -536,6 +558,43 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
         }
 
         _ => None,
+    }
+}
+
+/// Overlay a matched Ethereum L1 leg onto a Hemi-derived transfer.
+///
+/// - `TunnelLock` (ETH→Hemi): the real L1 deposit replaces the mirrored source leg.
+/// - `TunnelRelease` (Hemi→ETH): the L1 release fills the destination leg and finalizes.
+fn enrich_with_eth_leg(t: &mut TunnelTransfer, eth: &EthereumEvent) {
+    let now = Utc::now();
+    match eth {
+        EthereumEvent::TunnelLock { tx_hash, from, block_number, gas_fee, .. } => {
+            t.source_tx = ChainTransaction {
+                chain: Chain::Ethereum,
+                hash: ChainTxHash::Evm(*tx_hash),
+                block_number: *block_number,
+                block_hash: BlockHash([0u8; 32]),
+                timestamp: now,
+                confirmations: 0,
+            };
+            t.sender = ChainAddress::Evm(Address(from.0));
+            t.source_fee = gas_fee.clone();
+        }
+        EthereumEvent::TunnelRelease { tx_hash, to, block_number, gas_fee, .. } => {
+            t.destination_tx = Some(ChainTransaction {
+                chain: Chain::Ethereum,
+                hash: ChainTxHash::Evm(*tx_hash),
+                block_number: *block_number,
+                block_hash: BlockHash([0u8; 32]),
+                timestamp: now,
+                confirmations: 0,
+            });
+            t.recipient = ChainAddress::Evm(Address(to.0));
+            t.dest_fee = gas_fee.clone();
+            t.status = TunnelStatus::Finalized;
+            t.finalized_at = Some(now);
+        }
+        EthereumEvent::BlockReorg { .. } => {}
     }
 }
 

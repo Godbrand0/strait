@@ -147,6 +147,25 @@ impl BitcoinKitCaller {
         Ok(None)
     }
 
+    /// Bitcoin transaction fee in sats = Σ input values − Σ output values.
+    ///
+    /// Best-effort: returns `None` unless BitcoinKit reports a *complete* set of
+    /// inputs and outputs (an incomplete set would understate the fee).
+    pub async fn get_tx_fee_sats(&self, txid: &BitcoinTxid) -> Result<Option<u64>> {
+        let call = IBitcoinKitV1::getTransactionByTxIdCall { txId: B256::from(txid.0) };
+        let result = self.call(call.abi_encode()).await?;
+        let tx = IBitcoinKitV1::getTransactionByTxIdCall::abi_decode_returns(&result, false)
+            .map_err(|e| StraitError::Parse(format!("getTransactionByTxId decode: {e}")))?
+            ._0;
+
+        if !tx.containsAllInputs || !tx.containsAllOutputs {
+            return Ok(None);
+        }
+        let total_in: u128 = tx.inputs.iter().map(|i| i.inValue.saturating_to::<u128>()).sum();
+        let total_out: u128 = tx.outputs.iter().map(|o| o.outValue.saturating_to::<u128>()).sum();
+        Ok(total_in.checked_sub(total_out).map(|f| f as u64))
+    }
+
     /// Execute a raw eth_call against the BitcoinKit precompile.
     async fn call(&self, data: Vec<u8>) -> Result<Vec<u8>> {
         use alloy::rpc::types::TransactionRequest;

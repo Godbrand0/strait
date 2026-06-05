@@ -101,12 +101,17 @@ impl BtcPayoutWatcher {
                     info!(txid = %hex::encode(txid.0), op_return = %hex::encode(&op), "payout OP_RETURN");
                 }
 
+                // Bitcoin network fee for the payout (Σ inputs − Σ outputs), best-effort.
+                let fee_sats = self.caller.get_tx_fee_sats(&txid).await.ok().flatten();
+                let dest_fee = fee_sats.map(bigdecimal::BigDecimal::from);
+
                 let txid_hex = hex::encode(txid.0);
-                repo.set_btc_payout(w.id, &txid_hex, None, Utc::now()).await?;
+                repo.set_btc_payout(w.id, &txid_hex, None, dest_fee, Utc::now()).await?;
                 info!(
                     transfer = %w.id,
                     recipient = %w.recipient,
                     sats = value,
+                    fee_sats = ?fee_sats,
                     confirmations = confs,
                     txid = %txid_hex,
                     "Hemi→BTC withdrawal FINALIZED — Bitcoin payout observed"

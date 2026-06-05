@@ -216,6 +216,7 @@ impl<'a> TunnelTransferRepo<'a> {
         id: Uuid,
         payout_txid: &str,
         payout_block: Option<i64>,
+        dest_fee: Option<BigDecimal>,
         finalized_at: DateTime<Utc>,
     ) -> Result<()> {
         sqlx::query(
@@ -224,13 +225,15 @@ impl<'a> TunnelTransferRepo<'a> {
                  dest_chain = 'BITCOIN',
                  dest_tx_hash = $2,
                  dest_block = COALESCE($3, dest_block),
-                 finalized_at = $4,
+                 dest_fee = COALESCE($4, dest_fee),
+                 finalized_at = $5,
                  updated_at = NOW()
              WHERE id = $1",
         )
         .bind(id)
         .bind(payout_txid)
         .bind(payout_block)
+        .bind(dest_fee)
         .bind(finalized_at)
         .execute(self.pool)
         .await
