@@ -10,10 +10,7 @@ use uuid::Uuid;
 
 use strait_core::{
     error::StraitError,
-    events::ChainEvent,
-    types::{
-        BlockRef, Chain, ChainTxHash, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer,
-    },
+    types::{BlockRef, Chain, ChainTxHash, TunnelStatus, TunnelTransfer},
 };
 
 /// Tracks in-flight transfers and the latest chain tip for each chain.

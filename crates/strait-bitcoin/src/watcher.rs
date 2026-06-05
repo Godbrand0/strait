@@ -32,7 +32,7 @@ use strait_core::{
     types::{Address, BitcoinAddress, BitcoinTxid},
 };
 
-use crate::contracts::{IBitcoinKitV1, SpentDetail, UTXO, Output, addresses};
+use crate::contracts::{IBitcoinKitV1, UTXO, addresses};
 
 // ============================================================================
 // BitcoinKit caller
@@ -247,7 +247,15 @@ impl CustodyWatcher {
         let tip_height = self.caller.get_tip_height().await.unwrap_or(0);
 
         for addr in &self.addresses.clone() {
-            let utxos = self.caller.get_utxos_for_address(addr).await?;
+            // One bad/invalid custody address must not fail the whole poll —
+            // log it and move on to the others.
+            let utxos = match self.caller.get_utxos_for_address(addr).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(address = %addr, error = %e, "Failed to read UTXOs for custody address — skipping");
+                    continue;
+                }
+            };
             debug!(address = %addr, count = utxos.len(), "Polled UTXOs");
 
             for utxo in utxos {

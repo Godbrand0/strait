@@ -19,7 +19,7 @@ use std::sync::Arc;
 use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use strait_bitcoin::{BitcoinIngester, BitcoinKitCaller, CustodyWatcher};
@@ -35,8 +35,10 @@ async fn main() -> anyhow::Result<()> {
     // ── Tracing ──────────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
+            // Clean operational default: meaningful events only. Per-block tracing
+            // lives at DEBUG — opt in with e.g. RUST_LOG=strait_evm=debug.
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,strait=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn")),
         )
         .init();
 
@@ -138,13 +140,25 @@ async fn main() -> anyhow::Result<()> {
         "All components started — indexing live. Press Ctrl-C to stop."
     );
 
-    // 8. Run until Ctrl-C or a core task dies unexpectedly
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown signal received — stopping");
-        }
-        _ = tasks.join_next() => {
-            error!("A core task exited unexpectedly — shutting down");
+    // 8. Run until Ctrl-C. If an individual component task exits (e.g. a chain's
+    //    RPC is misconfigured), log it and keep the rest of the node running —
+    //    one bad ingester must not take down the API or the healthy chains.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received — stopping");
+                break;
+            }
+            joined = tasks.join_next() => {
+                match joined {
+                    Some(Ok(())) => warn!("A component task exited — other components keep running"),
+                    Some(Err(e)) => error!("A component task panicked: {e} — other components keep running"),
+                    None => {
+                        warn!("All component tasks have exited — nothing left to do, stopping");
+                        break;
+                    }
+                }
+            }
         }
     }
 

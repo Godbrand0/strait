@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use strait_core::{
     config::{BTC_DEPOSIT_MATCH_WINDOW_SECS, ETH_DEPOSIT_MATCH_WINDOW_SECS},
     events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent},
-    types::{BitcoinTxid, Address},
+    types::BitcoinTxid,
 };
 
 /// Configuration for matching behavior.
