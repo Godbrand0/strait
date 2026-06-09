@@ -279,6 +279,42 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(rows)
     }
 
+    /// Search transfers by free text (id / sender / recipient / source or dest tx
+    /// hash, case-insensitive substring) plus optional status and route filters.
+    /// Any argument may be `None`; all present filters are ANDed.
+    pub async fn search(
+        &self,
+        query: Option<&str>,
+        status: Option<&str>,
+        route: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TunnelTransferRow>> {
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE ($1::text IS NULL OR (
+                     id::text ILIKE '%'||$1||'%'
+                     OR sender ILIKE '%'||$1||'%'
+                     OR recipient ILIKE '%'||$1||'%'
+                     OR source_tx_hash ILIKE '%'||$1||'%'
+                     OR dest_tx_hash ILIKE '%'||$1||'%'
+                   ))
+               AND ($2::text IS NULL OR status = $2)
+               AND ($3::text IS NULL OR route = $3)
+             ORDER BY created_at DESC
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(query)
+        .bind(status)
+        .bind(route)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
     /// Fetch a single transfer by id.
     pub async fn get(&self, id: Uuid) -> Result<Option<TunnelTransferRow>> {
         let row = sqlx::query_as::<_, TunnelTransferRow>(

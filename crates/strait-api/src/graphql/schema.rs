@@ -140,6 +140,31 @@ impl Query {
         Ok(rows.into_iter().map(Transfer::from).collect())
     }
 
+    /// Search transfers by id / address / tx hash (case-insensitive), with optional
+    /// `status` and `route` filters. All provided filters are combined (AND).
+    async fn search_transfers(
+        &self,
+        ctx: &Context<'_>,
+        query: Option<String>,
+        status: Option<String>,
+        route: Option<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> async_graphql::Result<Vec<Transfer>> {
+        let db = db(ctx)?;
+        let repo = TunnelTransferRepo::new(db);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let offset = offset.unwrap_or(0).max(0);
+        // Treat blank strings as "no filter".
+        let norm = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (query, status, route) = (norm(query), norm(status), norm(route));
+        let rows = repo
+            .search(query.as_deref(), status.as_deref(), route.as_deref(), limit, offset)
+            .await
+            .map_err(to_gql)?;
+        Ok(rows.into_iter().map(Transfer::from).collect())
+    }
+
     /// Aggregate indexer statistics.
     async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<Stats> {
         let db = db(ctx)?;

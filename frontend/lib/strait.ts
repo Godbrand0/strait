@@ -130,6 +130,21 @@ export async function getTransfer(
   return data?.transfer ?? null;
 }
 
+/** Search transfers by id / address / tx hash, with optional status & route filters. */
+export async function searchTransfers(
+  network: Network,
+  opts: { query?: string; status?: string; route?: string },
+): Promise<Transfer[]> {
+  const data = await graphql<{ searchTransfers: Transfer[] }>(
+    `query($q: String, $s: String, $r: String) {
+       searchTransfers(query: $q, status: $s, route: $r, limit: 100) { ${TRANSFER_FIELDS} }
+     }`,
+    { q: opts.query || null, s: opts.status || null, r: opts.route || null },
+    network,
+  );
+  return data?.searchTransfers ?? [];
+}
+
 // ── View helpers ─────────────────────────────────────────────────────────────
 
 export const STATUSES = ["INITIATED", "ANCHORED", "FINALIZED", "FAILED", "REORGED"] as const;

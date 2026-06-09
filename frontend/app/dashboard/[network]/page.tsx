@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import {
   getOverview,
+  searchTransfers,
   statusStyle,
   STATUSES,
   isNetwork,
@@ -8,23 +9,32 @@ import {
   type Transfer,
 } from "@/lib/strait";
 import TransferRow from "../TransferRow";
+import SearchFilter from "../SearchFilter";
 
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ network: string }>;
+  searchParams: Promise<{ q?: string; status?: string; route?: string }>;
 }) {
   const { network: seg } = await params;
   if (!isNetwork(seg)) notFound();
   const network: Network = seg;
 
+  const sp = await searchParams;
+  const filtering = Boolean(sp.q || sp.status || sp.route);
+
   const data = await getOverview(network);
 
   if (!data) return <OfflineState network={network} />;
 
-  const { stats, transfers } = data;
+  const { stats } = data;
+  const transfers = filtering
+    ? await searchTransfers(network, { query: sp.q, status: sp.status, route: sp.route })
+    : data.transfers;
   const counts = countByStatus(transfers);
   const anchored = transfers.filter((t) => t.popAnchored).length;
 
@@ -60,15 +70,18 @@ export default async function DashboardPage({
       {/* Status funnel */}
       <StatusFunnel counts={counts} total={transfers.length} />
 
-      {/* Recent transfers */}
-      <section>
-        <div className="flex items-baseline justify-between mb-3">
-          <h2 className="text-sm font-medium text-zinc-300">Recent transfers</h2>
+      {/* Search + transfers */}
+      <section className="space-y-4">
+        <SearchFilter network={network} />
+        <div className="flex items-baseline justify-between">
+          <h2 className="text-sm font-medium text-zinc-300">
+            {filtering ? "Search results" : "Recent transfers"}
+          </h2>
           <span className="text-xs text-zinc-500">{transfers.length} shown</span>
         </div>
 
         {transfers.length === 0 ? (
-          <EmptyTransfers />
+          <EmptyTransfers filtering={filtering} />
         ) : (
           <div className="overflow-hidden rounded-xl border border-white/[0.06]">
             <table className="w-full text-sm">
@@ -148,12 +161,14 @@ function StatusFunnel({ counts, total }: { counts: Record<string, number>; total
   );
 }
 
-function EmptyTransfers() {
+function EmptyTransfers({ filtering }: { filtering: boolean }) {
   return (
     <div className="rounded-xl border border-dashed border-white/10 px-6 py-14 text-center">
-      <p className="text-zinc-300">No transfers indexed yet.</p>
+      <p className="text-zinc-300">{filtering ? "No matching transfers." : "No transfers indexed yet."}</p>
       <p className="mt-1 text-sm text-zinc-500">
-        Once the node ingests a tunnel transfer on Hemi, it will appear here in real time.
+        {filtering
+          ? "Try a different address, transaction hash, or id — or clear the filters."
+          : "Once the node ingests a tunnel transfer on Hemi, it will appear here in real time."}
       </p>
     </div>
   );
