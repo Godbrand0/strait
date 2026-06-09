@@ -124,6 +124,8 @@ pub enum HemiEvent {
         /// Present for BTC routes — links to the Bitcoin deposit
         source_txid: Option<BitcoinTxid>,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
         /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,
@@ -136,6 +138,8 @@ pub enum HemiEvent {
         from: Address,
         destination: ChainAddress,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
         /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,
@@ -178,6 +182,8 @@ pub enum EthereumEvent {
         amount: BigDecimal,
         from: Address,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
         /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,
@@ -189,6 +195,8 @@ pub enum EthereumEvent {
         amount: BigDecimal,
         to: Address,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
         /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,

@@ -269,7 +269,7 @@ impl EvmIngester {
         log: Log,
         block_num: u64,
         _block_hash: B256,
-        _block_time: DateTime<Utc>,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         let tx_hash = log.transaction_hash
             .ok_or_else(|| StraitError::Parse("Missing transaction hash".into()))?;
@@ -298,7 +298,7 @@ impl EvmIngester {
                 if let Ok(decoded) = IStandardBridge::ETHBridgeFinalized::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_eth_deposit(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                    self.handle_eth_deposit(from, to, decoded.amount, tx_hash, block_num, log_index, block_time).await?;
                 }
             }
         } else if topic0 == topics::eth_bridge_initiated() {
@@ -309,7 +309,7 @@ impl EvmIngester {
                 if let Ok(decoded) = IStandardBridge::ETHBridgeInitiated::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_eth_withdrawal(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                    self.handle_eth_withdrawal(from, to, decoded.amount, tx_hash, block_num, log_index, block_time).await?;
                 }
             }
         } else if topic0 == topics::erc20_bridge_finalized() {
@@ -327,7 +327,7 @@ impl EvmIngester {
                     let to = Address(decoded.to.into());
                     self.handle_erc20_deposit(
                         local_token, remote_token, from, to,
-                        decoded.amount, tx_hash, block_num, log_index,
+                        decoded.amount, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -346,7 +346,7 @@ impl EvmIngester {
                     let to = Address(decoded.to.into());
                     self.handle_erc20_withdrawal(
                         local_token, remote_token, from, to,
-                        decoded.amount, tx_hash, block_num, log_index,
+                        decoded.amount, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -368,7 +368,7 @@ impl EvmIngester {
                 ) {
                     self.handle_btc_deposit_confirmed(
                         addr_from_topic(vault_t), recipient, deposit_tx_id,
-                        decoded.netSatsAfterFee, tx_hash, block_num, log_index,
+                        decoded.netSatsAfterFee, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -385,7 +385,7 @@ impl EvmIngester {
                 ) {
                     self.handle_btc_withdrawal_initiated(
                         withdrawer, decoded.netSatsAfterFee, decoded.uuid,
-                        tx_hash, block_num, log_index,
+                        tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -431,6 +431,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeFinalized (deposit on Hemi)");
         let gas_fee = self.fetch_gas_fee(tx_hash).await;
@@ -443,6 +444,7 @@ impl EvmIngester {
                 amount: amount_bd,
                 to,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -454,6 +456,7 @@ impl EvmIngester {
                 to,
                 source_txid: None,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -470,6 +473,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeInitiated (withdrawal from Hemi)");
         let gas_fee = self.fetch_gas_fee(tx_hash).await;
@@ -482,6 +486,7 @@ impl EvmIngester {
                 amount: amount_bd,
                 from,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -493,6 +498,7 @@ impl EvmIngester {
                 from,
                 destination: ChainAddress::Evm(to),
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
                 uuid: None,
@@ -512,6 +518,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             token = %hex::encode(local_token.0),
@@ -531,6 +538,7 @@ impl EvmIngester {
                 amount: amount_bd,
                 to,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -542,6 +550,7 @@ impl EvmIngester {
                 to,
                 source_txid: None,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -560,6 +569,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             token = %hex::encode(local_token.0),
@@ -579,6 +589,7 @@ impl EvmIngester {
                 amount: amount_bd,
                 from,
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
             })
@@ -590,6 +601,7 @@ impl EvmIngester {
                 from,
                 destination: ChainAddress::Evm(to),
                 block_number: block_num,
+                block_time,
                 log_index,
                 gas_fee,
                 uuid: None,
@@ -640,6 +652,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             recipient = %hex::encode(recipient.0),
@@ -654,6 +667,7 @@ impl EvmIngester {
             to: recipient,
             source_txid: Some(BitcoinTxid(deposit_tx_id)),
             block_number: block_num,
+            block_time,
             log_index,
             gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
@@ -675,6 +689,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         // The btcAddress is `indexed` in the event (only a keccak hash survives in the
         // topic), but the originating initiateWithdrawal(uint32,string,uint256) call
@@ -699,6 +714,7 @@ impl EvmIngester {
             from: withdrawer,
             destination,
             block_number: block_num,
+            block_time,
             log_index,
             gas_fee: self.fetch_gas_fee(tx_hash).await,
             uuid: Some(uuid),

@@ -376,7 +376,7 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
         return None;
     };
 
-    let now = Utc::now();
+    let now = *block_time;
     let recipient = match hemi_destination {
         Some(addr) => ChainAddress::Evm(Address(addr.0)),
         // Unparseable OP_RETURN — recipient unknown until the Hemi mint enriches it.
@@ -425,7 +425,6 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
 ///
 /// Returns `None` for non-tunnel Hemi events (reorg, keystone).
 fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
-    let now = Utc::now();
     match event {
         HemiEvent::TunnelMint {
             tx_hash,
@@ -434,9 +433,11 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             to,
             source_txid,
             block_number,
+            block_time,
             log_index,
             gas_fee,
         } => {
+            let now = *block_time;
             let route = if matches!(asset, Asset::Btc) {
                 TunnelRoute::BtcToHemi
             } else {
@@ -521,10 +522,12 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             from,
             destination,
             block_number,
+            block_time,
             log_index,
             gas_fee,
             uuid,
         } => {
+            let now = *block_time;
             let route = match destination {
                 ChainAddress::Bitcoin(_) => TunnelRoute::HemiToBtc,
                 ChainAddress::Evm(_) => TunnelRoute::HemiToEth,
@@ -570,33 +573,34 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
 /// - `TunnelLock` (ETH→Hemi): the real L1 deposit replaces the mirrored source leg.
 /// - `TunnelRelease` (Hemi→ETH): the L1 release fills the destination leg and finalizes.
 fn enrich_with_eth_leg(t: &mut TunnelTransfer, eth: &EthereumEvent) {
-    let now = Utc::now();
     match eth {
-        EthereumEvent::TunnelLock { tx_hash, from, block_number, gas_fee, .. } => {
+        EthereumEvent::TunnelLock { tx_hash, from, block_number, block_time, gas_fee, .. } => {
             t.source_tx = ChainTransaction {
                 chain: Chain::Ethereum,
                 hash: ChainTxHash::Evm(*tx_hash),
                 block_number: *block_number,
                 block_hash: BlockHash([0u8; 32]),
-                timestamp: now,
+                timestamp: *block_time,
                 confirmations: 0,
             };
             t.sender = ChainAddress::Evm(Address(from.0));
             t.source_fee = gas_fee.clone();
+            // The L1 lock is the real initiation moment for an ETH→Hemi deposit.
+            t.initiated_at = *block_time;
         }
-        EthereumEvent::TunnelRelease { tx_hash, to, block_number, gas_fee, .. } => {
+        EthereumEvent::TunnelRelease { tx_hash, to, block_number, block_time, gas_fee, .. } => {
             t.destination_tx = Some(ChainTransaction {
                 chain: Chain::Ethereum,
                 hash: ChainTxHash::Evm(*tx_hash),
                 block_number: *block_number,
                 block_hash: BlockHash([0u8; 32]),
-                timestamp: now,
+                timestamp: *block_time,
                 confirmations: 0,
             });
             t.recipient = ChainAddress::Evm(Address(to.0));
             t.dest_fee = gas_fee.clone();
             t.status = TunnelStatus::Finalized;
-            t.finalized_at = Some(now);
+            t.finalized_at = Some(*block_time);
         }
         EthereumEvent::BlockReorg { .. } => {}
     }
@@ -739,6 +743,7 @@ mod tests {
             to: Address::from_hex(REAL_TO).unwrap(),
             source_txid: None,
             block_number: REAL_BLOCK,
+            block_time: Utc::now(),
             log_index: 1,
             gas_fee: None,
         })
@@ -781,6 +786,7 @@ mod tests {
                 to: Address::from_hex(REAL_TO).unwrap(),
                 source_txid: Some(BitcoinTxid([3u8; 32])),
                 block_number: REAL_BLOCK,
+                block_time: Utc::now(),
                 log_index: 1,
                 gas_fee: None,
             }))
@@ -873,6 +879,7 @@ mod tests {
                 to: dest,
                 source_txid: Some(txid),
                 block_number: 6_037_628,
+                block_time: Utc::now(),
                 log_index: 0,
                 gas_fee: None,
             }))

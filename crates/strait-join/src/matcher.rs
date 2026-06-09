@@ -422,6 +422,7 @@ mod tests {
             to,
             source_txid,
             block_number: 200,
+            block_time: Utc::now(),
             log_index: 0,
             gas_fee: None,
         })
