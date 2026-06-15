@@ -124,7 +124,11 @@ pub enum HemiEvent {
         /// Present for BTC routes — links to the Bitcoin deposit
         source_txid: Option<BitcoinTxid>,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
+        /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A tunnel burn (assets being withdrawn from Hemi)
     TunnelBurn {
@@ -134,7 +138,14 @@ pub enum HemiEvent {
         from: Address,
         destination: ChainAddress,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
+        /// Gas spent on this Hemi tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
+        /// BTC withdrawal uuid (vaultIndex << 32 | vaultUUID); `None` for ETH routes.
+        /// The 4-byte vaultUUID is echoed in the Bitcoin payout's OP_RETURN.
+        uuid: Option<u64>,
     },
     /// Emitted when PoPPayoutsV2.PayoutRoundExecuted fires on Hemi.
     ///
@@ -171,7 +182,11 @@ pub enum EthereumEvent {
         amount: BigDecimal,
         from: Address,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
+        /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A tunnel release (assets released from Hemi to Ethereum)
     TunnelRelease {
@@ -180,7 +195,11 @@ pub enum EthereumEvent {
         amount: BigDecimal,
         to: Address,
         block_number: u64,
+        /// On-chain block timestamp (the real time the tx was mined).
+        block_time: DateTime<Utc>,
         log_index: u32,
+        /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
+        gas_fee: Option<BigDecimal>,
     },
     /// A chain reorganization was detected
     BlockReorg {

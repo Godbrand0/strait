@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import {
   type Transfer,
+  type Network,
   formatAmount,
   routeLabel,
   statusStyle,
@@ -12,13 +13,13 @@ import {
 } from "@/lib/strait";
 
 /** A clickable transfer row — the whole row navigates to the detail page. */
-export default function TransferRow({ t }: { t: Transfer }) {
+export default function TransferRow({ t, network }: { t: Transfer; network: Network }) {
   const router = useRouter();
   const s = statusStyle(t.status);
   const kind = transferKind(t.direction);
   return (
     <tr
-      onClick={() => router.push(`/dashboard/transfers/${t.id}`)}
+      onClick={() => router.push(`/dashboard/${network}/transfers/${t.id}`)}
       className="cursor-pointer border-b border-white/[0.04] last:border-0 hover:bg-white/[0.04] transition-colors"
     >
       <td className="px-4 py-3">

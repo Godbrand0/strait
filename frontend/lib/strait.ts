@@ -1,16 +1,44 @@
 // Strait GraphQL client + view helpers (server-side).
 
-export const STRAIT_API_URL =
-  process.env.STRAIT_API_URL ?? "http://localhost:8080/graphql";
+// Strait runs one node per network; the dashboard can point at either. Each
+// network has its own API endpoint and block-explorer bases (all overridable
+// via env). Add a network here and a route segment picks it up automatically.
+export type Network = "mainnet" | "testnet";
 
-// Block-explorer bases. Default to mainnet (the node's default target); override
-// via env for testnet, e.g. NEXT_PUBLIC_HEMI_EXPLORER=https://testnet.explorer.hemi.xyz
-const HEMI_EXPLORER =
-  process.env.NEXT_PUBLIC_HEMI_EXPLORER ?? "https://explorer.hemi.xyz";
-const BTC_EXPLORER =
-  process.env.NEXT_PUBLIC_BTC_EXPLORER ?? "https://mempool.space";
-const ETH_EXPLORER =
-  process.env.NEXT_PUBLIC_ETH_EXPLORER ?? "https://etherscan.io";
+type NetworkConfig = {
+  label: string;
+  apiUrl: string;
+  hemiExplorer: string;
+  btcExplorer: string;
+  ethExplorer: string;
+};
+
+export const NETWORKS: Record<Network, NetworkConfig> = {
+  mainnet: {
+    label: "Mainnet",
+    apiUrl: process.env.STRAIT_API_URL ?? "http://localhost:8080/graphql",
+    hemiExplorer: process.env.NEXT_PUBLIC_HEMI_EXPLORER ?? "https://explorer.hemi.xyz",
+    btcExplorer: process.env.NEXT_PUBLIC_BTC_EXPLORER ?? "https://mempool.space",
+    ethExplorer: process.env.NEXT_PUBLIC_ETH_EXPLORER ?? "https://etherscan.io",
+  },
+  testnet: {
+    label: "Testnet",
+    apiUrl: process.env.STRAIT_TESTNET_API_URL ?? "http://localhost:8081/graphql",
+    hemiExplorer:
+      process.env.NEXT_PUBLIC_HEMI_TESTNET_EXPLORER ?? "https://testnet.explorer.hemi.xyz",
+    btcExplorer:
+      process.env.NEXT_PUBLIC_BTC_TESTNET_EXPLORER ?? "https://mempool.space/testnet",
+    ethExplorer:
+      process.env.NEXT_PUBLIC_ETH_TESTNET_EXPLORER ?? "https://sepolia.etherscan.io",
+  },
+};
+
+export const DEFAULT_NETWORK: Network = "mainnet";
+
+/** Narrow an arbitrary route segment to a known Network. */
+export function isNetwork(s: string | undefined): s is Network {
+  return s === "mainnet" || s === "testnet";
+}
 
 export type Transfer = {
   id: string;
@@ -28,6 +56,8 @@ export type Transfer = {
   destChain: string | null;
   destTxHash: string | null;
   destBlock: number | null;
+  sourceFee: string | null;
+  destFee: string | null;
   popAnchored: boolean;
   popKeystoneBlock: number | null;
   popScore: number | null;
@@ -42,6 +72,7 @@ const TRANSFER_FIELDS = `
   id asset direction route amount sender recipient status
   sourceChain sourceTxHash sourceBlock sourceTimestamp
   destChain destTxHash destBlock
+  sourceFee destFee
   popAnchored popKeystoneBlock popScore popAnchoredAt
   initiatedAt finalizedAt
 `;
@@ -51,9 +82,10 @@ const TRANSFER_FIELDS = `
 export async function graphql<T>(
   query: string,
   variables?: Record<string, unknown>,
+  network: Network = DEFAULT_NETWORK,
 ): Promise<T | null> {
   try {
-    const res = await fetch(STRAIT_API_URL, {
+    const res = await fetch(NETWORKS[network].apiUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query, variables }),
@@ -72,22 +104,45 @@ export async function graphql<T>(
   }
 }
 
-export async function getOverview(): Promise<{
+export async function getOverview(network: Network = DEFAULT_NETWORK): Promise<{
   stats: Stats;
   transfers: Transfer[];
 } | null> {
-  return graphql(`{
+  return graphql(
+    `{
     stats { totalTransfers }
     transfers(limit: 50) { ${TRANSFER_FIELDS} }
-  }`);
+  }`,
+    undefined,
+    network,
+  );
 }
 
-export async function getTransfer(id: string): Promise<Transfer | null> {
+export async function getTransfer(
+  id: string,
+  network: Network = DEFAULT_NETWORK,
+): Promise<Transfer | null> {
   const data = await graphql<{ transfer: Transfer | null }>(
     `query($id: UUID!) { transfer(id: $id) { ${TRANSFER_FIELDS} } }`,
     { id },
+    network,
   );
   return data?.transfer ?? null;
+}
+
+/** Search transfers by id / address / tx hash, with optional status & route filters. */
+export async function searchTransfers(
+  network: Network,
+  opts: { query?: string; status?: string; route?: string },
+): Promise<Transfer[]> {
+  const data = await graphql<{ searchTransfers: Transfer[] }>(
+    `query($q: String, $s: String, $r: String) {
+       searchTransfers(query: $q, status: $s, route: $r, limit: 100) { ${TRANSFER_FIELDS} }
+     }`,
+    { q: opts.query || null, s: opts.status || null, r: opts.route || null },
+    network,
+  );
+  return data?.searchTransfers ?? [];
 }
 
 // ── View helpers ─────────────────────────────────────────────────────────────
@@ -178,16 +233,34 @@ export function sourceObserved(t: Transfer): boolean {
   return t.sourceChain === "BITCOIN" || t.sourceBlock > 0;
 }
 
+/** Format a per-leg network fee for display: sats→BTC on Bitcoin, wei→ETH (or gwei
+ *  when tiny) on EVM chains. Returns null when no fee was captured. */
+export function formatFee(chain: string | null, fee: string | null): string | null {
+  if (!fee || fee === "0") return null;
+  if (chain === "BITCOIN") {
+    return `${(Number(fee) / 1e8).toFixed(8)} BTC`;
+  }
+  const eth = Number(fee) / 1e18;
+  return eth < 0.00001
+    ? `${(Number(fee) / 1e9).toLocaleString()} gwei`
+    : `${eth.toFixed(6)} ETH`;
+}
+
 /** Build an explorer link for a tx on a given chain ("BITCOIN" | "HEMI" | "ETHEREUM"). */
-export function txExplorerUrl(chain: string | null, hash: string | null): string | null {
+export function txExplorerUrl(
+  chain: string | null,
+  hash: string | null,
+  network: Network = DEFAULT_NETWORK,
+): string | null {
   if (!hash) return null;
+  const cfg = NETWORKS[network];
   switch (chain) {
     case "BITCOIN":
-      return `${BTC_EXPLORER}/tx/${hash.replace(/^0x/, "")}`;
+      return `${cfg.btcExplorer}/tx/${hash.replace(/^0x/, "")}`;
     case "HEMI":
-      return `${HEMI_EXPLORER}/tx/${hash}`;
+      return `${cfg.hemiExplorer}/tx/${hash}`;
     case "ETHEREUM":
-      return `${ETH_EXPLORER}/tx/${hash}`;
+      return `${cfg.ethExplorer}/tx/${hash}`;
     default:
       return null;
   }

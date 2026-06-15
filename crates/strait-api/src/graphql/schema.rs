@@ -36,6 +36,11 @@ pub struct Transfer {
     pub dest_tx_hash: Option<String>,
     pub dest_block: Option<i64>,
 
+    /// Network fee on the source leg, atomic units (wei or sats) as a string, or null.
+    pub source_fee: Option<String>,
+    /// Network fee on the destination leg, atomic units (wei or sats) as a string, or null.
+    pub dest_fee: Option<String>,
+
     /// Whether this transfer has been PoP-anchored to Bitcoin.
     pub pop_anchored: bool,
     /// The Hemi keystone block (multiple of 25) that anchored it.
@@ -67,6 +72,8 @@ impl From<TunnelTransferRow> for Transfer {
             dest_chain: r.dest_chain,
             dest_tx_hash: r.dest_tx_hash,
             dest_block: r.dest_block,
+            source_fee: r.source_fee.map(|d| d.with_scale(0).to_string()),
+            dest_fee: r.dest_fee.map(|d| d.with_scale(0).to_string()),
             pop_anchored: r.pop_anchored,
             pop_keystone_block: r.pop_keystone_block,
             pop_score: r.pop_score,
@@ -128,6 +135,31 @@ impl Query {
         let offset = offset.unwrap_or(0).max(0);
         let rows = repo
             .list_by_recipient(&recipient, limit, offset)
+            .await
+            .map_err(to_gql)?;
+        Ok(rows.into_iter().map(Transfer::from).collect())
+    }
+
+    /// Search transfers by id / address / tx hash (case-insensitive), with optional
+    /// `status` and `route` filters. All provided filters are combined (AND).
+    async fn search_transfers(
+        &self,
+        ctx: &Context<'_>,
+        query: Option<String>,
+        status: Option<String>,
+        route: Option<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> async_graphql::Result<Vec<Transfer>> {
+        let db = db(ctx)?;
+        let repo = TunnelTransferRepo::new(db);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let offset = offset.unwrap_or(0).max(0);
+        // Treat blank strings as "no filter".
+        let norm = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (query, status, route) = (norm(query), norm(status), norm(route));
+        let rows = repo
+            .search(query.as_deref(), status.as_deref(), route.as_deref(), limit, offset)
             .await
             .map_err(to_gql)?;
         Ok(rows.into_iter().map(Transfer::from).collect())
@@ -207,6 +239,9 @@ mod tests {
                 timestamp: now,
                 confirmations: 0,
             }),
+            source_fee: None,
+            dest_fee: None,
+            withdrawal_uuid: None,
             pop_anchored: false,
             pop_keystone_block: None,
             pop_score: None,

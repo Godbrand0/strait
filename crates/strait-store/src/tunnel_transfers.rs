@@ -37,6 +37,14 @@ pub struct TunnelTransferRow {
     pub dest_tx_hash: Option<String>,
     pub dest_block: Option<i64>,
 
+    /// Per-leg network fee in the chain's atomic unit (wei for EVM, sats for BTC).
+    #[serde(serialize_with = "serialize_opt_plain_decimal")]
+    pub source_fee: Option<BigDecimal>,
+    #[serde(serialize_with = "serialize_opt_plain_decimal")]
+    pub dest_fee: Option<BigDecimal>,
+    /// BTC withdrawal uuid, used to match the Bitcoin payout by its OP_RETURN.
+    pub withdrawal_uuid: Option<i64>,
+
     pub pop_anchored: bool,
     pub pop_keystone_block: Option<i64>,
     pub pop_score: Option<i64>,
@@ -79,9 +87,10 @@ impl<'a> TunnelTransferRepo<'a> {
                 source_chain, source_tx_hash, source_block, source_timestamp,
                 dest_chain, dest_tx_hash, dest_block,
                 pop_anchored, pop_keystone_block, pop_score, pop_anchored_at,
-                initiated_at, finalized_at
+                initiated_at, finalized_at,
+                source_fee, dest_fee, withdrawal_uuid
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             ON CONFLICT (id) DO UPDATE SET
                 -- Never let a late INITIATED event regress an advanced status.
                 status             = CASE WHEN EXCLUDED.status = 'INITIATED'
@@ -104,6 +113,9 @@ impl<'a> TunnelTransferRepo<'a> {
                 pop_score          = COALESCE(EXCLUDED.pop_score, tunnel_transfers.pop_score),
                 pop_anchored_at    = COALESCE(EXCLUDED.pop_anchored_at, tunnel_transfers.pop_anchored_at),
                 finalized_at       = COALESCE(EXCLUDED.finalized_at, tunnel_transfers.finalized_at),
+                source_fee         = COALESCE(EXCLUDED.source_fee, tunnel_transfers.source_fee),
+                dest_fee           = COALESCE(EXCLUDED.dest_fee, tunnel_transfers.dest_fee),
+                withdrawal_uuid    = COALESCE(EXCLUDED.withdrawal_uuid, tunnel_transfers.withdrawal_uuid),
                 updated_at         = NOW()
             "#,
         )
@@ -128,6 +140,9 @@ impl<'a> TunnelTransferRepo<'a> {
         .bind(t.pop_anchored_at)
         .bind(t.initiated_at)
         .bind(t.finalized_at)
+        .bind(t.source_fee.clone())
+        .bind(t.dest_fee.clone())
+        .bind(t.withdrawal_uuid.map(|v| v as i64))
         .execute(self.pool)
         .await
         .map_err(StraitError::Database)?;
@@ -205,6 +220,7 @@ impl<'a> TunnelTransferRepo<'a> {
         id: Uuid,
         payout_txid: &str,
         payout_block: Option<i64>,
+        dest_fee: Option<BigDecimal>,
         finalized_at: DateTime<Utc>,
     ) -> Result<()> {
         sqlx::query(
@@ -213,13 +229,15 @@ impl<'a> TunnelTransferRepo<'a> {
                  dest_chain = 'BITCOIN',
                  dest_tx_hash = $2,
                  dest_block = COALESCE($3, dest_block),
-                 finalized_at = $4,
+                 dest_fee = COALESCE($4, dest_fee),
+                 finalized_at = $5,
                  updated_at = NOW()
              WHERE id = $1",
         )
         .bind(id)
         .bind(payout_txid)
         .bind(payout_block)
+        .bind(dest_fee)
         .bind(finalized_at)
         .execute(self.pool)
         .await
@@ -253,6 +271,42 @@ impl<'a> TunnelTransferRepo<'a> {
              ORDER BY created_at DESC LIMIT $2 OFFSET $3",
         )
         .bind(recipient)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// Search transfers by free text (id / sender / recipient / source or dest tx
+    /// hash, case-insensitive substring) plus optional status and route filters.
+    /// Any argument may be `None`; all present filters are ANDed.
+    pub async fn search(
+        &self,
+        query: Option<&str>,
+        status: Option<&str>,
+        route: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TunnelTransferRow>> {
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE ($1::text IS NULL OR (
+                     id::text ILIKE '%'||$1||'%'
+                     OR sender ILIKE '%'||$1||'%'
+                     OR recipient ILIKE '%'||$1||'%'
+                     OR source_tx_hash ILIKE '%'||$1||'%'
+                     OR dest_tx_hash ILIKE '%'||$1||'%'
+                   ))
+               AND ($2::text IS NULL OR status = $2)
+               AND ($3::text IS NULL OR route = $3)
+             ORDER BY created_at DESC
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(query)
+        .bind(status)
+        .bind(route)
         .bind(limit)
         .bind(offset)
         .fetch_all(self.pool)
@@ -303,6 +357,17 @@ fn serialize_plain_decimal<S: serde::Serializer>(
     serializer.serialize_str(&amount.with_scale(0).to_string())
 }
 
+/// Like `serialize_plain_decimal` but for an optional fee — `null` when absent.
+fn serialize_opt_plain_decimal<S: serde::Serializer>(
+    amount: &Option<BigDecimal>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match amount {
+        Some(d) => serializer.serialize_str(&d.with_scale(0).to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Canonical string form of a transfer status (matches the values written by the engine).
 pub fn status_str(status: &TunnelStatus) -> &'static str {
     match status {
@@ -344,6 +409,9 @@ mod db_tests {
             direction: TunnelDirection::In,
             route: TunnelRoute::EthToHemi,
             amount: BigDecimal::from(130_000_000_000_000_000u64),
+            source_fee: None,
+            dest_fee: None,
+            withdrawal_uuid: None,
             sender: ChainAddress::Evm(to),
             recipient: ChainAddress::Evm(to),
             status: TunnelStatus::Initiated,
@@ -448,6 +516,9 @@ mod db_tests {
             direction: TunnelDirection::In,
             route: TunnelRoute::BtcToHemi,
             amount: BigDecimal::from(amount),
+            source_fee: None,
+            dest_fee: None,
+            withdrawal_uuid: None,
             sender: ChainAddress::Bitcoin(BitcoinAddress::new("btctx:..")),
             recipient: ChainAddress::Evm(to),
             status,

@@ -154,9 +154,26 @@ impl JoinEngine {
             // ingester. The matcher (below) handles cross-chain enrichment once
             // BitcoinEvent / EthereumEvent source legs are produced.
             RawEvent::Hemi(HemiEvent::TunnelMint { .. } | HemiEvent::TunnelBurn { .. }) => {
+                // Only ETH-route legs need the matcher (BTC routes converge via their
+                // txid on the direct path). Feeding BTC mints here would leave them
+                // pending forever, so gate on the ETH-route shape.
+                let eth_route = matches!(
+                    &event,
+                    RawEvent::Hemi(HemiEvent::TunnelMint { source_txid: None, .. })
+                        | RawEvent::Hemi(HemiEvent::TunnelBurn {
+                            destination: ChainAddress::Evm(_),
+                            ..
+                        })
+                );
                 if let RawEvent::Hemi(hemi) = &event {
                     if let Some(transfer) = transfer_from_hemi_event(hemi) {
                         self.register_transfer(transfer).await?;
+                    }
+                }
+                // Feed the matcher so a later Ethereum L1 leg enriches this transfer.
+                if eth_route {
+                    if let Some(m) = self.matcher.process_event(event) {
+                        self.handle_match(m).await?;
                     }
                 }
             }
@@ -253,19 +270,24 @@ impl JoinEngine {
     async fn handle_match(&mut self, m: crate::matcher::MatchResult) -> Result<()> {
         debug!(direction = ?m.direction, amount = m.amount, "Cross-chain match found");
 
-        // The Hemi leg of the match is the authoritative transfer record. Materialize
-        // it (deduplicated by deterministic id inside `register_transfer`). Once the
-        // source-side ingesters come online, this is where the Bitcoin/Ethereum source
-        // tx would additionally enrich the record.
-        for ev in [&m.source, &m.destination] {
-            if let RawEvent::Hemi(hemi) = ev {
-                if let Some(transfer) = transfer_from_hemi_event(hemi) {
-                    self.register_transfer(transfer).await?;
-                }
-            }
-        }
+        // The Hemi leg is the authoritative transfer record (deduplicated by
+        // deterministic id in `register_transfer`); the matched Ethereum leg enriches
+        // it with the real L1 source (deposits) or release (withdrawals).
+        let hemi = [&m.source, &m.destination].into_iter().find_map(|e| match e {
+            RawEvent::Hemi(h) => Some(h),
+            _ => None,
+        });
+        let eth = [&m.source, &m.destination].into_iter().find_map(|e| match e {
+            RawEvent::Ethereum(x) => Some(x),
+            _ => None,
+        });
 
-        Ok(())
+        let Some(hemi) = hemi else { return Ok(()); };
+        let Some(mut transfer) = transfer_from_hemi_event(hemi) else { return Ok(()); };
+        if let Some(eth) = eth {
+            enrich_with_eth_leg(&mut transfer, eth);
+        }
+        self.register_transfer(transfer).await
     }
 
     /// Insert (or refresh) a transfer in state and emit a `Created` update for the
@@ -354,7 +376,7 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
         return None;
     };
 
-    let now = Utc::now();
+    let now = *block_time;
     let recipient = match hemi_destination {
         Some(addr) => ChainAddress::Evm(Address(addr.0)),
         // Unparseable OP_RETURN — recipient unknown until the Hemi mint enriches it.
@@ -383,6 +405,9 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
             confirmations: 0,
         },
         destination_tx: None,
+        source_fee: None,
+        dest_fee: None,
+        withdrawal_uuid: None,
         pop_anchored: false,
         pop_keystone_block: None,
         pop_score: None,
@@ -400,7 +425,6 @@ fn transfer_from_btc_deposit(event: &BitcoinEvent) -> Option<TunnelTransfer> {
 ///
 /// Returns `None` for non-tunnel Hemi events (reorg, keystone).
 fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
-    let now = Utc::now();
     match event {
         HemiEvent::TunnelMint {
             tx_hash,
@@ -409,8 +433,11 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             to,
             source_txid,
             block_number,
+            block_time,
             log_index,
+            gas_fee,
         } => {
+            let now = *block_time;
             let route = if matches!(asset, Asset::Btc) {
                 TunnelRoute::BtcToHemi
             } else {
@@ -477,6 +504,9 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                     timestamp: now,
                     confirmations: 0,
                 }),
+                source_fee: None,
+                dest_fee: gas_fee.clone(),
+                withdrawal_uuid: None,
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,
@@ -492,8 +522,12 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             from,
             destination,
             block_number,
+            block_time,
             log_index,
+            gas_fee,
+            uuid,
         } => {
+            let now = *block_time;
             let route = match destination {
                 ChainAddress::Bitcoin(_) => TunnelRoute::HemiToBtc,
                 ChainAddress::Evm(_) => TunnelRoute::HemiToEth,
@@ -519,6 +553,9 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
                     confirmations: 0,
                 },
                 destination_tx: None,
+                source_fee: gas_fee.clone(),
+                dest_fee: None,
+                withdrawal_uuid: *uuid,
                 pop_anchored: false,
                 pop_keystone_block: None,
                 pop_score: None,
@@ -528,6 +565,44 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
         }
 
         _ => None,
+    }
+}
+
+/// Overlay a matched Ethereum L1 leg onto a Hemi-derived transfer.
+///
+/// - `TunnelLock` (ETH→Hemi): the real L1 deposit replaces the mirrored source leg.
+/// - `TunnelRelease` (Hemi→ETH): the L1 release fills the destination leg and finalizes.
+fn enrich_with_eth_leg(t: &mut TunnelTransfer, eth: &EthereumEvent) {
+    match eth {
+        EthereumEvent::TunnelLock { tx_hash, from, block_number, block_time, gas_fee, .. } => {
+            t.source_tx = ChainTransaction {
+                chain: Chain::Ethereum,
+                hash: ChainTxHash::Evm(*tx_hash),
+                block_number: *block_number,
+                block_hash: BlockHash([0u8; 32]),
+                timestamp: *block_time,
+                confirmations: 0,
+            };
+            t.sender = ChainAddress::Evm(Address(from.0));
+            t.source_fee = gas_fee.clone();
+            // The L1 lock is the real initiation moment for an ETH→Hemi deposit.
+            t.initiated_at = *block_time;
+        }
+        EthereumEvent::TunnelRelease { tx_hash, to, block_number, block_time, gas_fee, .. } => {
+            t.destination_tx = Some(ChainTransaction {
+                chain: Chain::Ethereum,
+                hash: ChainTxHash::Evm(*tx_hash),
+                block_number: *block_number,
+                block_hash: BlockHash([0u8; 32]),
+                timestamp: *block_time,
+                confirmations: 0,
+            });
+            t.recipient = ChainAddress::Evm(Address(to.0));
+            t.dest_fee = gas_fee.clone();
+            t.status = TunnelStatus::Finalized;
+            t.finalized_at = Some(*block_time);
+        }
+        EthereumEvent::BlockReorg { .. } => {}
     }
 }
 
@@ -668,7 +743,9 @@ mod tests {
             to: Address::from_hex(REAL_TO).unwrap(),
             source_txid: None,
             block_number: REAL_BLOCK,
+            block_time: Utc::now(),
             log_index: 1,
+            gas_fee: None,
         })
     }
 
@@ -709,7 +786,9 @@ mod tests {
                 to: Address::from_hex(REAL_TO).unwrap(),
                 source_txid: Some(BitcoinTxid([3u8; 32])),
                 block_number: REAL_BLOCK,
+                block_time: Utc::now(),
                 log_index: 1,
+                gas_fee: None,
             }))
             .await
             .unwrap();
@@ -800,7 +879,9 @@ mod tests {
                 to: dest,
                 source_txid: Some(txid),
                 block_number: 6_037_628,
+                block_time: Utc::now(),
                 log_index: 0,
+                gas_fee: None,
             }))
             .await
             .unwrap();
