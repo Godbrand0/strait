@@ -14,21 +14,29 @@
 //!     the payout's OP_RETURN would be exact once its encoding is confirmed — we log
 //!     any OP_RETURN found on a matched payout to help confirm that encoding.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::primitives::B256;
+use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
 use chrono::Utc;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use strait_bitcoin::BitcoinKitCaller;
 use strait_core::error::Result;
 use strait_core::types::BitcoinTxid;
+use strait_evm::contracts::IBitcoinTunnelManager;
 use strait_store::{Database, TunnelTransferRepo};
 
 /// Polls pending Hemi→BTC withdrawals and finalizes each one whose Bitcoin payout
 /// is observed via BitcoinKit.
 pub struct BtcPayoutWatcher {
     caller: BitcoinKitCaller,
+    /// Hemi EVM provider — used to retry recovering the BTC destination address
+    /// from initiateWithdrawal calldata for withdrawals that failed at index time.
+    hemi_provider: Arc<dyn Provider>,
     db: Database,
     poll_interval: Duration,
     min_confirmations: u32,
@@ -37,12 +45,14 @@ pub struct BtcPayoutWatcher {
 impl BtcPayoutWatcher {
     pub fn new(
         caller: BitcoinKitCaller,
+        hemi_provider: Arc<dyn Provider>,
         db: Database,
         poll_interval_secs: u64,
         min_confirmations: u32,
     ) -> Self {
         Self {
             caller,
+            hemi_provider,
             db,
             // Payouts confirm over minutes — polling faster just burdens the Hemi RPC.
             poll_interval: Duration::from_secs(poll_interval_secs.max(60)),
@@ -65,16 +75,34 @@ impl BtcPayoutWatcher {
     }
 
     async fn tick(&self) -> Result<()> {
+        // Phase 1: Retry BTC address recovery for withdrawals with placeholder recipients.
+        // At indexing time, recover_withdrawal_btc_address may have failed (rate limit,
+        // transient RPC error). Re-try here on every poll cycle so these withdrawals
+        // eventually get a real address and can be matched by the UTXO phase below.
+        if let Err(e) = self.retry_placeholder_addresses().await {
+            warn!(error = %e, "BTC address recovery retry phase failed");
+        }
+
+        // Phase 2: Check UTXOs for withdrawals with real BTC addresses.
         let repo = TunnelTransferRepo::new(&self.db);
         let pending = repo.list_pending_btc_payouts(200).await?;
         for w in pending {
             if !is_real_btc_address(&w.recipient) {
                 continue; // placeholder recipient — nothing to watch yet
             }
+            // Pace requests across the Hemi RPC to avoid rate-limit bursts.
+            // With many pending withdrawals each requiring multiple eth_call lookups
+            // (UTXOs, OP_RETURN, confirmations, fee), firing them all at once easily
+            // fills a 300-req/60s rolling window. 200ms between withdrawals keeps
+            // the burst spread across the full poll interval.
+            sleep(Duration::from_millis(200)).await;
             // The withdrawal's 4-byte vaultUUID is echoed in the payout's OP_RETURN —
             // the deterministic key that disambiguates otherwise-identical withdrawals
             // (same recipient + amount). Without it, amount matching mis-attributes.
-            let Some(uuid) = w.withdrawal_uuid else { continue };
+            let Some(uuid) = w.withdrawal_uuid else {
+                debug!(transfer = %w.id, "skipping HEMI_TO_BTC withdrawal — no uuid recorded");
+                continue;
+            };
             let want_vault_uuid = (uuid as u64 & 0xffff_ffff) as u32;
 
             let utxos = match self.caller.get_utxos_for_address(&w.recipient).await {
@@ -119,6 +147,75 @@ impl BtcPayoutWatcher {
                     "Hemi→BTC withdrawal FINALIZED — Bitcoin payout matched by uuid"
                 );
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// For each INITIATED Hemi→BTC withdrawal whose BTC address could not be recovered
+    /// at indexing time (stored as `withdrawal-uuid-N`), attempt to decode the real
+    /// address from the initiateWithdrawal transaction calldata.
+    ///
+    /// Failures at index time are almost always transient (RPC rate limit / timeout),
+    /// so retrying here on every poll cycle lets placeholder withdrawals self-heal.
+    async fn retry_placeholder_addresses(&self) -> Result<()> {
+        let repo = TunnelTransferRepo::new(&self.db);
+        let pending = repo.list_btc_withdrawals_needing_recipient(50).await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        debug!(count = pending.len(), "Retrying BTC address recovery for placeholder withdrawals");
+
+        for w in pending {
+            sleep(Duration::from_millis(200)).await;
+
+            // Parse the Hemi source tx hash stored in DB.
+            let tx_bytes = match hex::decode(w.source_tx_hash.trim_start_matches("0x")) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    debug!(transfer = %w.id, "invalid source_tx_hash — skipping address retry");
+                    continue;
+                }
+            };
+            let tx_hash = B256::from_slice(&tx_bytes);
+
+            let tx = match self.hemi_provider.get_transaction_by_hash(tx_hash).await {
+                Ok(Some(tx)) => tx,
+                Ok(None) => {
+                    debug!(transfer = %w.id, "tx not found for placeholder withdrawal");
+                    continue;
+                }
+                Err(e) => {
+                    debug!(transfer = %w.id, error = %e, "tx fetch failed for placeholder withdrawal");
+                    continue;
+                }
+            };
+
+            let decoded =
+                match IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(tx.input.as_ref(), false) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        debug!(
+                            transfer = %w.id,
+                            "initiateWithdrawal calldata decode failed — may be a different entry point"
+                        );
+                        continue;
+                    }
+                };
+
+            let btc_addr = decoded.btcAddress;
+            if !is_real_btc_address(&btc_addr) {
+                debug!(transfer = %w.id, addr = %btc_addr, "decoded btcAddress is not a valid BTC address");
+                continue;
+            }
+
+            match repo.update_btc_withdrawal_recipient(w.id, &btc_addr).await {
+                Ok(()) => info!(
+                    transfer = %w.id,
+                    btc_address = %btc_addr,
+                    "Recovered real BTC address for Hemi→BTC withdrawal — payout matching now active"
+                ),
+                Err(e) => warn!(transfer = %w.id, error = %e, "Failed to update BTC withdrawal recipient"),
             }
         }
         Ok(())

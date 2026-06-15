@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     drop(event_tx);
 
     // 7. Join engine — consumes RawEvent, emits TunnelTransferUpdate
-    let engine = JoinEngine::new(event_rx, update_tx);
+    let engine = JoinEngine::new(event_rx, update_tx, db.clone());
 
     // 8. Spawn every long-running component
     let mut tasks = tokio::task::JoinSet::new();
@@ -121,12 +121,12 @@ async fn main() -> anyhow::Result<()> {
     // observed. Runs unconditionally (it reads recipients from the DB; no custody
     // addresses needed) and reads Bitcoin state through BitcoinKit on Hemi.
     {
-        let caller = build_bitcoin_kit_caller(&config, payout_kit_provider);
+        let caller = build_bitcoin_kit_caller(&config, payout_kit_provider.clone());
         let db = db.clone();
         let interval = config.bitcoin.poll_interval_secs;
         let confs = config.bitcoin.confirmation_depth;
         tasks.spawn(async move {
-            let watcher = payout_watcher::BtcPayoutWatcher::new(caller, db, interval, confs);
+            let watcher = payout_watcher::BtcPayoutWatcher::new(caller, payout_kit_provider, db, interval, confs);
             if let Err(e) = watcher.run().await {
                 error!("BTC payout watcher exited: {e}");
             }
