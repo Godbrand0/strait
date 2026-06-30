@@ -199,6 +199,128 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
+    /// Find a Hemi→ETH withdrawal in INITIATED status matching the Ethereum recipient
+    /// address and exact amount — used by the DB-backed finalization fallback.
+    ///
+    /// Returns the oldest matching transfer (ASC by initiated_at) so that repeated
+    /// withdrawals of the same amount are finalized in initiation order.
+    pub async fn find_pending_eth_withdrawal(
+        &self,
+        recipient: &str,
+        amount: &BigDecimal,
+    ) -> Result<Option<TunnelTransferRow>> {
+        let row = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_ETH'
+               AND status = 'INITIATED'
+               AND lower(recipient) = lower($1)
+               AND amount = $2
+             ORDER BY initiated_at ASC
+             LIMIT 1",
+        )
+        .bind(recipient)
+        .bind(amount)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(row)
+    }
+
+    /// Mark a Hemi→ETH withdrawal FINALIZED once its L1 release tx is confirmed.
+    pub async fn set_eth_withdrawal_finalized(
+        &self,
+        id: Uuid,
+        dest_tx_hash: &str,
+        dest_block: Option<i64>,
+        dest_fee: Option<BigDecimal>,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE tunnel_transfers
+             SET status       = 'FINALIZED',
+                 dest_chain   = 'ETHEREUM',
+                 dest_tx_hash = $2,
+                 dest_block   = COALESCE($3, dest_block),
+                 dest_fee     = COALESCE($4, dest_fee),
+                 finalized_at = $5,
+                 updated_at   = NOW()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(dest_tx_hash)
+        .bind(dest_block)
+        .bind(dest_fee)
+        .bind(finalized_at)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
+    /// Find INITIATED BTC→Hemi deposits whose Hemi mint block is covered by the
+    /// given keystone window `(keystone_block - 25, keystone_block]`.
+    ///
+    /// Used as a DB-backed fallback for PoP keystone anchoring after a node restart —
+    /// when the JoinEngine's in-memory state is empty, pending deposits would otherwise
+    /// be silently skipped by the keystone fan-out.
+    pub async fn list_initiated_btc_deposits_in_keystone_window(
+        &self,
+        keystone_block: i64,
+    ) -> Result<Vec<TunnelTransferRow>> {
+        let window_start = keystone_block.saturating_sub(25);
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'BTC_TO_HEMI'
+               AND status = 'INITIATED'
+               AND dest_chain = 'HEMI'
+               AND dest_block > $1
+               AND dest_block <= $2",
+        )
+        .bind(window_start)
+        .bind(keystone_block)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// List Hemi→BTC withdrawals whose BTC address recovery failed at indexing time —
+    /// INITIATED transfers with a `withdrawal-uuid-N` placeholder recipient but a
+    /// known uuid. The payout watcher retries calldata decoding for these.
+    pub async fn list_btc_withdrawals_needing_recipient(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<TunnelTransferRow>> {
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_BTC'
+               AND status = 'INITIATED'
+               AND withdrawal_uuid IS NOT NULL
+               AND recipient LIKE 'withdrawal-uuid-%'
+             ORDER BY initiated_at ASC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// Update the BTC recipient for a Hemi→BTC withdrawal that had a placeholder.
+    /// Called by the payout watcher after recovering the real address from calldata.
+    pub async fn update_btc_withdrawal_recipient(&self, id: Uuid, btc_address: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE tunnel_transfers SET recipient = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(btc_address)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
     /// List Hemi→BTC withdrawals still awaiting their Bitcoin payout (status
     /// `INITIATED`), most recent first — candidates for payout matching.
     pub async fn list_pending_btc_payouts(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {

@@ -23,7 +23,7 @@ use strait_core::{
     events::{RawEvent, HemiEvent, EthereumEvent},
     types::{Address, Asset, BitcoinTxid, Chain, ChainAddress, BitcoinAddress, TxHash},
 };
-use strait_store::{CheckpointRepo, Database, UpsertCheckpoint};
+use strait_store::{CheckpointRepo, Database, TunnelTransferRepo, UpsertCheckpoint};
 
 use crate::contracts::{IBitcoinTunnelManager, IPoPPayoutsV2, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
@@ -65,22 +65,40 @@ impl EvmIngester {
     #[instrument(skip(self), fields(chain = %self.config.chain_id))]
     pub async fn run(self) -> Result<()> {
         info!("Starting EVM ingester for chain {}", self.config.chain_id);
-        
+
         let mut last_block = self.get_start_block().await?;
         info!("Starting from block {}", last_block);
-        
+
+        // Exponential backoff state for rate-limit (429) errors.
+        // On first 429: wait 10s. Each subsequent: double, capped at 5 minutes.
+        // Resets to 0 on any successful poll.
+        let mut rate_limit_backoff_secs: u64 = 0;
+
         loop {
             match self.process_new_blocks(&last_block).await {
                 Ok(new_last) => {
                     last_block = new_last;
+                    rate_limit_backoff_secs = 0;
+                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
                 }
                 Err(e) => {
-                    error!("Error processing blocks: {}", e);
-                    sleep(Duration::from_secs(5)).await;
+                    if is_rate_limit_error(&e) {
+                        rate_limit_backoff_secs = if rate_limit_backoff_secs == 0 {
+                            10
+                        } else {
+                            (rate_limit_backoff_secs * 2).min(300)
+                        };
+                        warn!(
+                            backoff_secs = rate_limit_backoff_secs,
+                            "Rate limit (429) — backing off before retry"
+                        );
+                        sleep(Duration::from_secs(rate_limit_backoff_secs)).await;
+                    } else {
+                        error!("Error processing blocks: {}", e);
+                        sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
-            
-            sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
     }
 
@@ -155,14 +173,19 @@ impl EvmIngester {
         // This keeps RPC usage far below per-block scanning — important on rate-limited
         // public endpoints — and we checkpoint once per window (re-processing a window
         // after a crash is harmless, as all writes are idempotent upserts).
-        const LOG_RANGE: u64 = 100;
+        let log_range = self.config.log_range.max(1);
+        let backfilling = confirmed.saturating_sub(*last_block) > log_range;
         let mut new_last = *last_block;
         while new_last < confirmed {
             let from = new_last + 1;
-            let to = (from + LOG_RANGE - 1).min(confirmed);
+            let to = (from + log_range - 1).min(confirmed);
             let to_hash = self.process_block_range(from, to).await?;
             self.save_checkpoint(to, to_hash).await?;
             new_last = to;
+            // Throttle during backfill to avoid hammering the RPC.
+            if backfilling && new_last < confirmed {
+                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            }
         }
 
         // Heartbeat so a caught-up node is visibly alive (range scanning is otherwise
@@ -243,6 +266,20 @@ impl EvmIngester {
             if !btc.is_empty() {
                 addresses.push(btc.parse().map_err(|e| {
                     StraitError::Parse(format!("Invalid BTC tunnel contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(portal) = self.config.opt_portal_contract.as_deref() {
+            if !portal.is_empty() {
+                addresses.push(portal.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid OptimismPortal contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(pop) = self.config.pop_payouts_contract.as_deref() {
+            if !pop.is_empty() {
+                addresses.push(pop.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid PoPPayoutsV2 contract address: {}", e))
                 })?);
             }
         }
@@ -414,6 +451,23 @@ impl EvmIngester {
                 let vault_address = addr_from_topic(vault_t);
                 info!(vault = %hex::encode(vault_address.0), "New BTC tunnel vault created — add to watched addresses");
             }
+
+        // ── OptimismPortal events (HEMI_TO_ETH two-step withdrawal) ──────────
+        //
+        // WithdrawalProven fires when proveWithdrawalTransaction is called, starting
+        // the 1-day OP Stack challenge window. Only watched when ETH_OPT_PORTAL_CONTRACT
+        // is configured (not a standard bridge address).
+
+        } else if topic0 == topics::withdrawal_proven() {
+            // WithdrawalProven(indexed bytes32 withdrawalHash, indexed address from, indexed address to)
+            if let (Some(hash_t), Some(from_t), Some(to_t)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let withdrawal_hash = TxHash(hash_t.0);
+                let from = addr_from_topic(from_t);
+                let to   = addr_from_topic(to_t);
+                self.handle_withdrawal_proven(withdrawal_hash, from, to, tx_hash, block_num, log_index, block_time).await?;
+            }
         } else {
             debug!("Unknown event topic {:?}, skipping", topic0);
         }
@@ -437,17 +491,57 @@ impl EvmIngester {
         let gas_fee = self.fetch_gas_fee(tx_hash).await;
         let amount_bd = u256_to_bigdecimal(amount)?;
         let event = if self.chain == Chain::Ethereum {
-            // On L1, a "finalized" bridge event is a withdrawal released to the user.
-            RawEvent::Ethereum(EthereumEvent::TunnelRelease {
+            // On L1, ETHBridgeFinalized is the withdrawal release — funds returned to the user.
+            // First emit the TunnelRelease event so the in-memory matcher can finalize same-session
+            // withdrawals (where the Hemi burn and the L1 release happen without a node restart).
+            let release = RawEvent::Ethereum(EthereumEvent::TunnelRelease {
                 tx_hash: TxHash(tx_hash.0),
                 asset: Asset::Eth,
-                amount: amount_bd,
+                amount: amount_bd.clone(),
                 to,
                 block_number: block_num,
                 block_time,
                 log_index,
-                gas_fee,
-            })
+                gas_fee: gas_fee.clone(),
+            });
+
+            // DB-backed fallback: if the Hemi burn happened in a previous node session (common
+            // — the OP Stack challenge period is ~1 day), the in-memory matcher's pending_hemi_burns
+            // map is empty and the TunnelRelease would be silently dropped.  Query the DB directly
+            // so restarts don't permanently strand Hemi→ETH withdrawals at INITIATED.
+            let recipient = format!("0x{}", hex::encode(to.0));
+            let dest_tx_hex = format!("0x{}", hex::encode(tx_hash.0));
+            let repo = TunnelTransferRepo::new(&self.db);
+            match repo.find_pending_eth_withdrawal(&recipient, &amount_bd).await {
+                Ok(Some(transfer)) => {
+                    match repo
+                        .set_eth_withdrawal_finalized(
+                            transfer.id,
+                            &dest_tx_hex,
+                            Some(block_num as i64),
+                            gas_fee,
+                            block_time,
+                        )
+                        .await
+                    {
+                        Ok(()) => info!(
+                            transfer_id = %transfer.id,
+                            dest_tx = %dest_tx_hex,
+                            block = block_num,
+                            "Hemi→ETH withdrawal FINALIZED via DB-backed L1 release match"
+                        ),
+                        Err(e) => warn!(error = %e, "DB finalization write failed for ETH withdrawal"),
+                    }
+                }
+                Ok(None) => {
+                    // No pending INITIATED transfer found — either it was already finalized
+                    // by the in-memory matcher this session, or this is an unknown release.
+                    debug!(recipient = %recipient, amount = %amount_bd, "No pending HEMI_TO_ETH transfer found for L1 release");
+                }
+                Err(e) => warn!(error = %e, "DB lookup failed for pending ETH withdrawal"),
+            }
+
+            release
         } else {
             RawEvent::Hemi(HemiEvent::TunnelMint {
                 tx_hash: TxHash(tx_hash.0),
@@ -733,6 +827,80 @@ impl EvmIngester {
                 .ok()?;
         Some(decoded.btcAddress)
     }
+
+    // ── OptimismPortal handler (HEMI_TO_ETH two-step withdrawal) ─────────────
+
+    /// Handle WithdrawalProven — `proveWithdrawalTransaction` was called on OptimismPortal,
+    /// starting the 1-day OP Stack challenge window for a HEMI_TO_ETH withdrawal.
+    ///
+    /// Emits a `WithdrawalProven` event to the channel and directly advances the
+    /// matching DB transfer from INITIATED → PROVING.
+    ///
+    /// `WithdrawalProven` carries no amount, so matching is by `to` (recipient) address
+    /// only — FIFO ordering (oldest INITIATED first) handles same-user concurrent
+    /// withdrawals correctly.
+    async fn handle_withdrawal_proven(
+        &self,
+        withdrawal_hash: TxHash,
+        from: Address,
+        to: Address,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+        block_time: DateTime<Utc>,
+    ) -> Result<()> {
+        info!(
+            withdrawal_hash = %withdrawal_hash,
+            from = %hex::encode(from.0),
+            to   = %hex::encode(to.0),
+            "WithdrawalProven — OP Stack 1-day challenge window started"
+        );
+
+        let event = RawEvent::Ethereum(EthereumEvent::WithdrawalProven {
+            withdrawal_hash,
+            from,
+            to,
+            tx_hash: TxHash(tx_hash.0),
+            block_number: block_num,
+            block_time,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
+
+        // DB-backed advance: find the oldest INITIATED HEMI_TO_ETH withdrawal for
+        // this recipient and advance it to PROVING.
+        let recipient = format!("0x{}", hex::encode(to.0));
+        let repo = TunnelTransferRepo::new(&self.db);
+        match repo.find_eth_withdrawal_for_proving(&recipient).await {
+            Ok(Some(transfer)) => {
+                match repo.set_eth_withdrawal_proving(transfer.id, block_time).await {
+                    Ok(()) => info!(
+                        transfer_id = %transfer.id,
+                        block = block_num,
+                        "HEMI_TO_ETH withdrawal INITIATED → PROVING (challenge window open)"
+                    ),
+                    Err(e) => warn!(error = %e, "DB proving write failed for ETH withdrawal"),
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    recipient = %recipient,
+                    "WithdrawalProven: no INITIATED HEMI_TO_ETH withdrawal found in DB"
+                );
+            }
+            Err(e) => warn!(error = %e, "DB lookup failed for withdrawal proving"),
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns true if the error is an HTTP 429 / rate-limit response from the RPC.
+/// Used to distinguish rate limiting from real failures so we can back off properly.
+fn is_rate_limit_error(e: &StraitError) -> bool {
+    let s = e.to_string();
+    s.contains("429") || s.contains("rate limit") || s.contains("rate_limit") || s.contains("-32005")
 }
 
 /// Extract an EVM address from a 32-byte log topic (right-padded to 32 bytes).

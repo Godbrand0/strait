@@ -27,6 +27,7 @@ use strait_core::{
         PopAnchor, ReorgEvent, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer, TxHash,
     },
 };
+use strait_store::{Database, TunnelTransferRepo};
 
 use crate::{matcher::EventMatcher, state::TransferState};
 
@@ -77,10 +78,31 @@ pub struct JoinEngine {
     matcher: EventMatcher,
     /// Most recent keystone block confirmed as PoP-anchored.
     last_anchored_keystone: u64,
+    /// DB handle for the keystone anchoring fallback — picks up BTC→Hemi
+    /// deposits that were INITIATED in a prior session (not in in-memory state).
+    /// `None` in unit tests (no real Postgres available).
+    db: Option<Database>,
 }
 
 impl JoinEngine {
     pub fn new(
+        event_rx: mpsc::Receiver<RawEvent>,
+        update_tx: mpsc::Sender<TunnelTransferUpdate>,
+        db: Database,
+    ) -> Self {
+        Self {
+            event_rx,
+            update_tx,
+            state: TransferState::new(),
+            matcher: EventMatcher::new(Default::default()),
+            last_anchored_keystone: 0,
+            db: Some(db),
+        }
+    }
+
+    /// Test-only constructor — skips the DB-backed keystone anchoring fallback.
+    #[cfg(test)]
+    fn new_for_test(
         event_rx: mpsc::Receiver<RawEvent>,
         update_tx: mpsc::Sender<TunnelTransferUpdate>,
     ) -> Self {
@@ -90,6 +112,7 @@ impl JoinEngine {
             state: TransferState::new(),
             matcher: EventMatcher::new(Default::default()),
             last_anchored_keystone: 0,
+            db: None,
         }
     }
 
@@ -235,14 +258,11 @@ impl JoinEngine {
             .map(|(id, _)| id)
             .collect();
 
-        if to_anchor.is_empty() {
-            debug!(keystone_block, "No transfers covered by this keystone");
-            return Ok(());
-        }
-
-        info!(keystone_block, count = to_anchor.len(), "Anchoring transfers");
-
         let anchored_at = Utc::now();
+
+        // In-memory fan-out — covers transfers seen in this session.
+        let mut anchored_in_memory: std::collections::HashSet<uuid::Uuid> =
+            std::collections::HashSet::with_capacity(to_anchor.len());
         for id in to_anchor {
             self.state.anchor(&id).map_err(|e| StraitError::Internal(e.to_string()))?;
             self.state.set_pop_anchor(&id, keystone_block, pop_score, anchored_at);
@@ -260,6 +280,48 @@ impl JoinEngine {
             }).await?;
 
             info!(transfer_id = %id, keystone_block, "Transfer INITIATED → ANCHORED via PoP keystone");
+            anchored_in_memory.insert(id);
+        }
+
+        // DB-backed fallback: after a node restart the in-memory state is empty, so
+        // BTC→Hemi deposits that were INITIATED in a prior session are invisible to
+        // the in-memory fan-out above. Query the DB for deposits in this keystone's
+        // window and anchor any that weren't already handled.
+        let Some(ref db) = self.db else { return Ok(()); };
+        let repo = TunnelTransferRepo::new(db);
+        match repo.list_initiated_btc_deposits_in_keystone_window(keystone_block as i64).await {
+            Ok(rows) => {
+                let db_count = rows.len();
+                for row in rows {
+                    if anchored_in_memory.contains(&row.id) {
+                        continue; // already handled by in-memory path
+                    }
+                    self.emit(TunnelTransferUpdate::PopAnchored {
+                        id: row.id,
+                        keystone_block,
+                        pop_score,
+                        anchored_at,
+                    }).await?;
+                    self.emit(TunnelTransferUpdate::StatusChanged {
+                        id: row.id,
+                        new_status: TunnelStatus::Anchored,
+                        updated_at: anchored_at,
+                    }).await?;
+                    info!(
+                        transfer_id = %row.id,
+                        keystone_block,
+                        "BTC→Hemi deposit INITIATED → ANCHORED via DB-backed keystone fallback"
+                    );
+                }
+                if db_count > 0 {
+                    debug!(keystone_block, count = db_count, "DB-backed keystone fallback checked");
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                keystone_block,
+                "DB-backed keystone anchoring fallback failed — in-session transfers were still anchored"
+            ),
         }
 
         Ok(())
@@ -774,7 +836,7 @@ mod tests {
     async fn engine_creates_then_pop_anchors_real_testnet_event() {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(32);
-        let handle = tokio::spawn(JoinEngine::new(event_rx, update_tx).run());
+        let handle = tokio::spawn(JoinEngine::new_for_test(event_rx, update_tx).run());
 
         // 1. A BTC→Hemi mint at the real testnet block → engine emits Created (INITIATED).
         //    PoP anchoring applies to BTC routes (ETH routes finalize immediately).
@@ -838,7 +900,7 @@ mod tests {
     async fn btc_deposit_and_mint_converge_on_one_transfer() {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(32);
-        let handle = tokio::spawn(JoinEngine::new(event_rx, update_tx).run());
+        let handle = tokio::spawn(JoinEngine::new_for_test(event_rx, update_tx).run());
 
         let txid = BitcoinTxid([7u8; 32]);
         let dest = Address::from_hex("0x065213232a03b6ef9c51e0c3250096474bb515b8").unwrap();

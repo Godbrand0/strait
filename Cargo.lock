@@ -4591,6 +4591,7 @@ dependencies = [
  "hex",
  "serde",
  "strait-core",
+ "strait-store",
  "tokio",
  "tokio-stream",
  "tracing",

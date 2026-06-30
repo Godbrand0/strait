@@ -71,6 +71,34 @@ manager.on("VaultCreated", (setupAdmin, operatorAdmin, vaultAddress) => {
 
 ---
 
+## Known mainnet vault custody addresses (June 2026)
+
+`BitcoinTunnelManager` (mainnet): `0xEAcA824F46c000fB89403846Bb57e6b913321081`
+
+9 vaults exist as of June 2026. The 7 unique Bitcoin custody addresses below are configured in `BITCOIN_TUNNEL_ADDRESSES` in `.env`.
+
+| Vault Index | Hemi Contract Address | Bitcoin Custody Address |
+|---|---|---|
+| 0 | `0x3DA10b74bD339E69c1dE9408020cE640B012E8CC` | `18AVmm853HVhibPHMc3JRLXMynzKAbj6Po` |
+| 1 | `0xeCF9C248FC63857e217214dAa82C1083cE8645D9` | `1CY4RxCxmzDC1W1iL9edAtJF2CTGeaJMbC` |
+| 2 | `0x13ca60FeFBe278F34bbAC50cAa121802474FCa43` | `12LcfeGZYzbiUqcLq1UvmMdtKFNa4niLEZ` |
+| 3 | `0xaabd93f4324eaB9e2Df736FF17eA22C9Eb239B10` | _(none — vault not yet configured)_ |
+| 4 | `0x96aA8D0DEEE02bD3F283e6896F57e2206A42A581` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` |
+| 5 | `0x654cE308839484a8a199354FAaED286E7B0C3a02` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` (same as vault 4) |
+| 6 | `0x3A29d25c255D3C5Be67fAA105936c21a0251FA2a` | `1GawhMSUVu3bgRiNmejbVTBjpwBygGWSqf` |
+| 7 | `0x5E6AbAD42E63cd7E8CE156fB8a8F0a3aEE464E33` | `bc1q4lpa9d5zxehge7vx86784gcxy23hc3xwp3gl422venswe6pvhh5qpn9xfj` |
+| 8 | `0x58f7B8D7A7291AaECE0FEbb39aA4E877387e61E4` | `1QDhzsteETKuw1M5kWHEjzaAmHSGhpH8zr` |
+
+**Notes:**
+
+- **Vault 3** has no Bitcoin custody address yet — it has not been configured by the operator.
+- **Vaults 4 and 5** share the same Bitcoin address (`16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo`). Deposits to that address are disambiguated by the `DepositConfirmed` event's `vault` field, not the Bitcoin address alone.
+- The `CustodyWatcher` uses the **BitcoinKit precompile on Hemi** to poll these addresses — no native Bitcoin node is required. `BITCOIN_RPC_URL` in `.env` is vestigial and only needed if you want direct Bitcoin RPC access for other purposes.
+- Without `BITCOIN_TUNNEL_ADDRESSES` set, BTC→Hemi deposits are still captured via Hemi's `DepositConfirmed` event but only appear after ~6 BTC confirmations (~1 hour). With addresses set, deposits appear as soon as the UTXO hits a custody address.
+- **Warning:** new vaults may be added over time. Monitor `VaultCreated` events or re-query `vaultCounter()` periodically and update `BITCOIN_TUNNEL_ADDRESSES` to keep the watch-set current.
+
+---
+
 ## OP_RETURN encoding
 
 A BTC deposit transaction must include an OP_RETURN output encoding the recipient's Hemi EVM address. The vault contract parses this from `output.script` (the full script including the OP_RETURN opcode), **not** from a decoded data field.
