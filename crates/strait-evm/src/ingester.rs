@@ -173,14 +173,19 @@ impl EvmIngester {
         // This keeps RPC usage far below per-block scanning — important on rate-limited
         // public endpoints — and we checkpoint once per window (re-processing a window
         // after a crash is harmless, as all writes are idempotent upserts).
-        const LOG_RANGE: u64 = 100;
+        let log_range = self.config.log_range.max(1);
+        let backfilling = confirmed.saturating_sub(*last_block) > log_range;
         let mut new_last = *last_block;
         while new_last < confirmed {
             let from = new_last + 1;
-            let to = (from + LOG_RANGE - 1).min(confirmed);
+            let to = (from + log_range - 1).min(confirmed);
             let to_hash = self.process_block_range(from, to).await?;
             self.save_checkpoint(to, to_hash).await?;
             new_last = to;
+            // Throttle during backfill to avoid hammering the RPC.
+            if backfilling && new_last < confirmed {
+                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            }
         }
 
         // Heartbeat so a caught-up node is visibly alive (range scanning is otherwise
@@ -261,6 +266,20 @@ impl EvmIngester {
             if !btc.is_empty() {
                 addresses.push(btc.parse().map_err(|e| {
                     StraitError::Parse(format!("Invalid BTC tunnel contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(portal) = self.config.opt_portal_contract.as_deref() {
+            if !portal.is_empty() {
+                addresses.push(portal.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid OptimismPortal contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(pop) = self.config.pop_payouts_contract.as_deref() {
+            if !pop.is_empty() {
+                addresses.push(pop.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid PoPPayoutsV2 contract address: {}", e))
                 })?);
             }
         }
@@ -431,6 +450,23 @@ impl EvmIngester {
             if let Some(vault_t) = log_topics.get(3) {
                 let vault_address = addr_from_topic(vault_t);
                 info!(vault = %hex::encode(vault_address.0), "New BTC tunnel vault created — add to watched addresses");
+            }
+
+        // ── OptimismPortal events (HEMI_TO_ETH two-step withdrawal) ──────────
+        //
+        // WithdrawalProven fires when proveWithdrawalTransaction is called, starting
+        // the 1-day OP Stack challenge window. Only watched when ETH_OPT_PORTAL_CONTRACT
+        // is configured (not a standard bridge address).
+
+        } else if topic0 == topics::withdrawal_proven() {
+            // WithdrawalProven(indexed bytes32 withdrawalHash, indexed address from, indexed address to)
+            if let (Some(hash_t), Some(from_t), Some(to_t)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let withdrawal_hash = TxHash(hash_t.0);
+                let from = addr_from_topic(from_t);
+                let to   = addr_from_topic(to_t);
+                self.handle_withdrawal_proven(withdrawal_hash, from, to, tx_hash, block_num, log_index, block_time).await?;
             }
         } else {
             debug!("Unknown event topic {:?}, skipping", topic0);
@@ -790,6 +826,73 @@ impl EvmIngester {
             IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(tx.input.as_ref(), false)
                 .ok()?;
         Some(decoded.btcAddress)
+    }
+
+    // ── OptimismPortal handler (HEMI_TO_ETH two-step withdrawal) ─────────────
+
+    /// Handle WithdrawalProven — `proveWithdrawalTransaction` was called on OptimismPortal,
+    /// starting the 1-day OP Stack challenge window for a HEMI_TO_ETH withdrawal.
+    ///
+    /// Emits a `WithdrawalProven` event to the channel and directly advances the
+    /// matching DB transfer from INITIATED → PROVING.
+    ///
+    /// `WithdrawalProven` carries no amount, so matching is by `to` (recipient) address
+    /// only — FIFO ordering (oldest INITIATED first) handles same-user concurrent
+    /// withdrawals correctly.
+    async fn handle_withdrawal_proven(
+        &self,
+        withdrawal_hash: TxHash,
+        from: Address,
+        to: Address,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+        block_time: DateTime<Utc>,
+    ) -> Result<()> {
+        info!(
+            withdrawal_hash = %withdrawal_hash,
+            from = %hex::encode(from.0),
+            to   = %hex::encode(to.0),
+            "WithdrawalProven — OP Stack 1-day challenge window started"
+        );
+
+        let event = RawEvent::Ethereum(EthereumEvent::WithdrawalProven {
+            withdrawal_hash,
+            from,
+            to,
+            tx_hash: TxHash(tx_hash.0),
+            block_number: block_num,
+            block_time,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
+
+        // DB-backed advance: find the oldest INITIATED HEMI_TO_ETH withdrawal for
+        // this recipient and advance it to PROVING.
+        let recipient = format!("0x{}", hex::encode(to.0));
+        let repo = TunnelTransferRepo::new(&self.db);
+        match repo.find_eth_withdrawal_for_proving(&recipient).await {
+            Ok(Some(transfer)) => {
+                match repo.set_eth_withdrawal_proving(transfer.id, block_time).await {
+                    Ok(()) => info!(
+                        transfer_id = %transfer.id,
+                        block = block_num,
+                        "HEMI_TO_ETH withdrawal INITIATED → PROVING (challenge window open)"
+                    ),
+                    Err(e) => warn!(error = %e, "DB proving write failed for ETH withdrawal"),
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    recipient = %recipient,
+                    "WithdrawalProven: no INITIATED HEMI_TO_ETH withdrawal found in DB"
+                );
+            }
+            Err(e) => warn!(error = %e, "DB lookup failed for withdrawal proving"),
+        }
+
+        Ok(())
     }
 }
 
