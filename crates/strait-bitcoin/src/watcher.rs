@@ -244,6 +244,8 @@ pub struct CustodyWatcher {
     addresses: HashSet<String>,
     /// Txids already processed — prevents re-emitting on subsequent polls.
     seen: HashSet<[u8; 32]>,
+    /// False until the first poll has seeded `seen` with pre-existing UTXOs.
+    initialized: bool,
 }
 
 impl CustodyWatcher {
@@ -252,11 +254,40 @@ impl CustodyWatcher {
             caller,
             addresses: addresses.into_iter().collect(),
             seen: HashSet::new(),
+            initialized: false,
         }
+    }
+
+    /// On the very first call, enumerate all currently-unspent UTXOs across every
+    /// watched address and mark them seen without processing them. These are
+    /// pre-existing deposits already captured by the Hemi EVM ingester via
+    /// DepositConfirmed. Marking them seen upfront avoids a burst of
+    /// getTransactionByTxId calls on startup that would saturate the rate limit.
+    async fn initialize_seen(&mut self) {
+        let mut total = 0usize;
+        for addr in &self.addresses.clone() {
+            let utxos = match self.caller.get_utxos_for_address(addr).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(address = %addr, error = %e, "Seed-seen UTXO fetch failed — will retry processing on next poll");
+                    continue;
+                }
+            };
+            for utxo in &utxos {
+                self.seen.insert(utxo.txId.into());
+            }
+            total += utxos.len();
+        }
+        info!(utxos_skipped = total, "Custody watcher initialized — pre-existing UTXOs marked seen, watching for new deposits only");
+        self.initialized = true;
     }
 
     /// Poll all watched addresses and return any new UTXOs not yet seen.
     pub async fn poll_new_deposits(&mut self) -> Result<Vec<DepositCandidate>> {
+        if !self.initialized {
+            self.initialize_seen().await;
+        }
+
         let mut candidates = Vec::new();
 
         // Bitcoin tip height (best-effort) so we can derive each deposit's block.
