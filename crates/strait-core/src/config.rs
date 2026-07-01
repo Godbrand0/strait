@@ -33,6 +33,13 @@ pub struct BitcoinConfig {
     /// Poll interval in seconds for checking new blocks
     #[serde(default = "default_bitcoin_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Separate Hemi RPC URL used exclusively for BitcoinKit precompile calls
+    /// (getUTXOsForBitcoinAddress, getTransactionOutputsByTxId, etc.).
+    /// Defaults to HEMI_RPC_URL if unset, but should be set to the public Hemi RPC
+    /// (https://rpc.hemi.network/rpc) to avoid burning premium-endpoint quota on
+    /// read-only precompile eth_call requests.
+    #[serde(default)]
+    pub bitcoin_kit_rpc_url: Option<String>,
 }
 
 /// EVM chain configuration (used for both Hemi and Ethereum)
@@ -144,7 +151,7 @@ fn default_bitcoin_confirmation_depth() -> u32 {
 }
 
 fn default_bitcoin_poll_interval() -> u64 {
-    10
+    60
 }
 
 fn default_start_block() -> u64 {
@@ -230,6 +237,7 @@ impl AppConfig {
                     "BITCOIN_POLL_INTERVAL_SECS",
                     default_bitcoin_poll_interval(),
                 ),
+                bitcoin_kit_rpc_url: env_opt("HEMI_BITCOIN_KIT_RPC_URL"),
             },
             hemi: EvmChainConfig {
                 rpc_url: env_str("HEMI_RPC_URL"),
@@ -337,7 +345,7 @@ mod tests {
     #[test]
     fn test_default_values() {
         assert_eq!(default_bitcoin_confirmation_depth(), 6);
-        assert_eq!(default_bitcoin_poll_interval(), 10);
+        assert_eq!(default_bitcoin_poll_interval(), 60);
         assert_eq!(default_start_block(), 0);
         assert_eq!(default_evm_confirmation_depth(), 12);
         assert_eq!(default_evm_poll_interval(), 1000);
@@ -356,6 +364,7 @@ mod tests {
                 tunnel_addresses: vec![],
                 confirmation_depth: 6,
                 poll_interval_secs: 10,
+                bitcoin_kit_rpc_url: None,
             },
             hemi: EvmChainConfig {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
