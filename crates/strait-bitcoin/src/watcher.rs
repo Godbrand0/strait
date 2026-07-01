@@ -123,23 +123,19 @@ impl BitcoinKitCaller {
 
     /// Read the OP_RETURN payload from a Bitcoin transaction by txid.
     ///
-    /// Uses `getTransactionOutputsByTxId` (precompile 0x??) which fetches only
-    /// the outputs — more efficient than `getTransactionByTxId` when inputs are
-    /// not needed. Iterates outputs looking for `isOpReturn == true` and returns
-    /// the raw `opReturnData` bytes from the first match.
-    ///
-    /// Returns `None` if the transaction has no OP_RETURN output.
+    /// Uses `getTransactionByTxId` and scans its outputs for `isOpReturn == true`.
+    /// Returns the raw `script` bytes from the first matching output, or `None`
+    /// if the transaction has no OP_RETURN output.
     pub async fn get_op_return_data(&self, txid: &BitcoinTxid) -> Result<Option<Vec<u8>>> {
-        let call = IBitcoinKitV1::getTransactionOutputsByTxIdCall { txId: B256::from(txid.0) };
+        let call = IBitcoinKitV1::getTransactionByTxIdCall { txId: B256::from(txid.0) };
         let result = self.call(call.abi_encode()).await?;
-        let decoded = IBitcoinKitV1::getTransactionOutputsByTxIdCall::abi_decode_returns(
-            &result, false,
-        )
-        .map_err(|e| StraitError::Parse(format!("getTransactionOutputsByTxId decode: {e}")))?;
+        let tx = IBitcoinKitV1::getTransactionByTxIdCall::abi_decode_returns(&result, false)
+            .map_err(|e| StraitError::Parse(format!("getTransactionByTxId decode: {e}")))?
+            ._0;
 
         // Pass output.script (the full OP_RETURN script including 0x6a prefix) to
         // parse_hemi_destination — the vault parses the script, not opReturnData.
-        for output in decoded._0 {
+        for output in tx.outputs {
             if output.isOpReturn {
                 return Ok(Some(output.script.to_vec()));
             }
