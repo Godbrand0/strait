@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -280,12 +281,22 @@ impl CustodyWatcher {
                     continue;
                 }
 
-                // Fetch OP_RETURN data to extract the Hemi destination
+                // Pace per-UTXO API calls to stay within the public Hemi RPC rate limit
+                // (300 req/min). Without this, a custody address with many existing UTXOs
+                // fires a burst of getTransactionByTxId calls on every poll, saturating
+                // the limit and causing 429s for the other watchers.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // Fetch OP_RETURN data to extract the Hemi destination.
+                // On any error (including 429) mark as seen to prevent re-bursting on
+                // the next poll. These are existing UTXOs already captured via
+                // DepositConfirmed events on Hemi; they'll be retried after a restart.
                 let bitcoin_txid = BitcoinTxid(txid);
                 let op_return = match self.caller.get_op_return_data(&bitcoin_txid).await {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(txid = %hex::encode(txid), error = %e, "OP_RETURN fetch failed — skipping UTXO");
+                        self.seen.insert(txid);
                         continue;
                     }
                 };
@@ -305,6 +316,7 @@ impl CustodyWatcher {
                     Ok(c) => c,
                     Err(e) => {
                         warn!(txid = %hex::encode(txid), error = %e, "Confirmation fetch failed — skipping UTXO");
+                        self.seen.insert(txid);
                         continue;
                     }
                 };
