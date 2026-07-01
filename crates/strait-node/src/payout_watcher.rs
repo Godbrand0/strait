@@ -91,11 +91,10 @@ impl BtcPayoutWatcher {
                 continue; // placeholder recipient — nothing to watch yet
             }
             // Pace requests across the Hemi RPC to avoid rate-limit bursts.
-            // With many pending withdrawals each requiring multiple eth_call lookups
-            // (UTXOs, OP_RETURN, confirmations, fee), firing them all at once easily
-            // fills a 300-req/60s rolling window. 200ms between withdrawals keeps
-            // the burst spread across the full poll interval.
-            sleep(Duration::from_millis(200)).await;
+            // Public Hemi RPC allows 300 req/min (5 req/s). With UTXOs + OP_RETURN +
+            // confirmations per withdrawal, 400ms gap keeps us well under that ceiling
+            // even when the custody watcher fires concurrently.
+            sleep(Duration::from_millis(400)).await;
             // The withdrawal's 4-byte vaultUUID is echoed in the payout's OP_RETURN —
             // the deterministic key that disambiguates otherwise-identical withdrawals
             // (same recipient + amount). Without it, amount matching mis-attributes.
@@ -167,7 +166,7 @@ impl BtcPayoutWatcher {
         debug!(count = pending.len(), "Retrying BTC address recovery for placeholder withdrawals");
 
         for w in pending {
-            sleep(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(400)).await;
 
             // Parse the Hemi source tx hash stored in DB.
             let tx_bytes = match hex::decode(w.source_tx_hash.trim_start_matches("0x")) {

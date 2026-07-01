@@ -286,7 +286,13 @@ impl CustodyWatcher {
 
                 // Fetch OP_RETURN data to extract the Hemi destination
                 let bitcoin_txid = BitcoinTxid(txid);
-                let op_return = self.caller.get_op_return_data(&bitcoin_txid).await?;
+                let op_return = match self.caller.get_op_return_data(&bitcoin_txid).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(txid = %hex::encode(txid), error = %e, "OP_RETURN fetch failed — skipping UTXO");
+                        continue;
+                    }
+                };
 
                 let hemi_destination = op_return.as_deref().and_then(parse_hemi_destination);
 
@@ -299,7 +305,13 @@ impl CustodyWatcher {
                     continue;
                 }
 
-                let confirmations = self.caller.get_confirmations(&bitcoin_txid).await?;
+                let confirmations = match self.caller.get_confirmations(&bitcoin_txid).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(txid = %hex::encode(txid), error = %e, "Confirmation fetch failed — skipping UTXO");
+                        continue;
+                    }
+                };
 
                 // Block height of the deposit tx ≈ tip - (confirmations - 1).
                 let block_height = if confirmations > 0 {
