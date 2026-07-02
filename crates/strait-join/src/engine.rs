@@ -1,17 +1,16 @@
 //! Join engine — consumes raw events from all three chain ingesters and
 //! produces TunnelTransfer lifecycle updates.
 //!
-//! # Keystone anchoring (BTC routes)
+//! # BTC→Hemi finality model
 //!
-//! BTC→Hemi transfers advance from INITIATED → ANCHORED when a
-//! `PopKeystoneAnchored` event covers the Hemi mint block.
-//!
-//! `PopAnchor::covers_block(mint_block)` is the authoritative check:
-//!   window = (keystone_block - 25, keystone_block]  (exclusive lower, inclusive upper)
+//! BTC→Hemi deposits are marked FINALIZED as soon as the Hemi mint tx is confirmed —
+//! the user has their hBTC and the transfer is complete. PoP anchoring is an additional
+//! Bitcoin-grade security property tracked by the `pop_anchored` / `pop_keystone_block`
+//! fields; it does not gate the FINALIZED status.
 //!
 //! When `PayoutRoundExecuted(blockRewarded)` fires on `PoPPayoutsV2`, the engine
-//! fans out to all in-flight transfers and advances those whose mint block is covered.
-//! ETH→Hemi uses OP Stack finality — no PoP wait required.
+//! fans out to all FINALIZED BTC→Hemi transfers in the keystone window and sets
+//! `pop_anchored = true`. ETH→Hemi also goes directly to FINALIZED via OP Stack finality.
 
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -67,6 +66,16 @@ pub enum TunnelTransferUpdate {
         pop_score: u64,
         anchored_at: chrono::DateTime<Utc>,
     },
+    /// A HEMI_TO_ETH withdrawal was finalized by the DB-backed fallback (node
+    /// restarted between the Hemi burn and the L1 release, so the in-memory
+    /// matcher had no pending burn to pair with the TunnelRelease).
+    EthWithdrawalFinalized {
+        id: Uuid,
+        dest_tx_hash: String,
+        dest_block: Option<i64>,
+        dest_fee: Option<bigdecimal::BigDecimal>,
+        finalized_at: chrono::DateTime<Utc>,
+    },
 }
 
 /// Consumes raw events from all chain ingesters and produces
@@ -82,6 +91,10 @@ pub struct JoinEngine {
     /// deposits that were INITIATED in a prior session (not in in-memory state).
     /// `None` in unit tests (no real Postgres available).
     db: Option<Database>,
+    /// Guards the one-time startup catch-up that retroactively anchors INITIATED
+    /// BTC→Hemi transfers whose keystone windows already passed before this session
+    /// started (e.g. the node was down when the keystone fired).
+    startup_catch_up_done: bool,
 }
 
 impl JoinEngine {
@@ -97,6 +110,7 @@ impl JoinEngine {
             matcher: EventMatcher::new(Default::default()),
             last_anchored_keystone: 0,
             db: Some(db),
+            startup_catch_up_done: false,
         }
     }
 
@@ -113,6 +127,7 @@ impl JoinEngine {
             matcher: EventMatcher::new(Default::default()),
             last_anchored_keystone: 0,
             db: None,
+            startup_catch_up_done: false,
         }
     }
 
@@ -201,6 +216,32 @@ impl JoinEngine {
                 }
             }
 
+            // Withdrawal challenge — operator failed to pay, hBTC re-minted to user.
+            // Mark the INITIATED HEMI_TO_BTC withdrawal as FAILED via the DB.
+            RawEvent::Hemi(HemiEvent::WithdrawalChallengeSuccess { uuid, .. }) => {
+                let uuid = *uuid;
+                if let Some(ref db) = self.db {
+                    let repo = TunnelTransferRepo::new(db);
+                    match repo.find_initiated_btc_withdrawal_by_uuid(uuid as i64).await {
+                        Ok(Some(row)) => {
+                            let now = Utc::now();
+                            self.emit(TunnelTransferUpdate::StatusChanged {
+                                id: row.id,
+                                new_status: TunnelStatus::Failed { reason: "operator_challenge".into() },
+                                updated_at: now,
+                            }).await?;
+                            info!(transfer_id = %row.id, uuid, "HEMI_TO_BTC withdrawal FAILED — challenge succeeded, operator did not pay");
+                        }
+                        Ok(None) => {
+                            warn!(uuid, "WithdrawalChallengeSuccess fired but no matching INITIATED withdrawal found");
+                        }
+                        Err(e) => {
+                            warn!(uuid, error = %e, "DB lookup failed for WithdrawalChallengeSuccess");
+                        }
+                    }
+                }
+            }
+
             // A Bitcoin custody deposit. For BTC routes the transfer id is derived
             // from the Bitcoin txid, so this and the later Hemi `DepositConfirmed`
             // mint converge on the same row — the deposit creates it early (with the
@@ -215,8 +256,16 @@ impl JoinEngine {
 
             // Cross-chain matching (Ethereum source legs / other Bitcoin events)
             _ => {
+                // Clone TunnelRelease events before the matcher consumes them so we can
+                // run the DB fallback if the in-memory burn state was lost on restart.
+                let eth_release = match &event {
+                    RawEvent::Ethereum(e @ EthereumEvent::TunnelRelease { .. }) => Some(e.clone()),
+                    _ => None,
+                };
                 if let Some(m) = self.matcher.process_event(event) {
                     self.handle_match(m).await?;
+                } else if let Some(eth) = eth_release {
+                    self.handle_unmatched_eth_release(&eth).await?;
                 }
             }
         }
@@ -273,13 +322,8 @@ impl JoinEngine {
                 pop_score,
                 anchored_at,
             }).await?;
-            self.emit(TunnelTransferUpdate::StatusChanged {
-                id,
-                new_status: TunnelStatus::Anchored,
-                updated_at: anchored_at,
-            }).await?;
 
-            info!(transfer_id = %id, keystone_block, "Transfer INITIATED → ANCHORED via PoP keystone");
+            info!(transfer_id = %id, keystone_block, "BTC→Hemi deposit PoP-anchored to Bitcoin (status stays FINALIZED)");
             anchored_in_memory.insert(id);
         }
 
@@ -302,15 +346,10 @@ impl JoinEngine {
                         pop_score,
                         anchored_at,
                     }).await?;
-                    self.emit(TunnelTransferUpdate::StatusChanged {
-                        id: row.id,
-                        new_status: TunnelStatus::Anchored,
-                        updated_at: anchored_at,
-                    }).await?;
                     info!(
                         transfer_id = %row.id,
                         keystone_block,
-                        "BTC→Hemi deposit INITIATED → ANCHORED via DB-backed keystone fallback"
+                        "BTC→Hemi deposit PoP-anchored via DB-backed keystone fallback"
                     );
                 }
                 if db_count > 0 {
@@ -324,6 +363,76 @@ impl JoinEngine {
             ),
         }
 
+        // One-time startup catch-up: anchor any INITIATED BTC→Hemi transfers whose
+        // keystone windows fell entirely before this session started. These were missed
+        // because the node was not running when their keystone events fired.
+        if !self.startup_catch_up_done {
+            self.startup_catch_up_done = true;
+            self.catch_up_stale_anchoring(keystone_block, &anchored_in_memory).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Retroactively anchor INITIATED BTC→Hemi transfers whose Hemi mint block is
+    /// older than the current keystone window — i.e., their keystone already fired in
+    /// a previous session but the node wasn't running at the time.
+    ///
+    /// Called once on the first keystone event of a session. Uses `pop_score = 0`
+    /// because the historical score is unknown, and attributes each transfer to the
+    /// keystone that would have covered its mint block (`keystone_for(dest_block)`).
+    async fn catch_up_stale_anchoring(
+        &self,
+        current_keystone: u64,
+        already_anchored: &std::collections::HashSet<Uuid>,
+    ) -> Result<()> {
+        let Some(ref db) = self.db else { return Ok(()); };
+        let repo = TunnelTransferRepo::new(db);
+
+        // Transfers with dest_block <= current_keystone - KEYSTONE_FREQ are
+        // strictly before the current window and are guaranteed stale.
+        let stale_before = current_keystone.saturating_sub(KEYSTONE_FREQ) as i64;
+        let rows = match repo.list_stale_initiated_btc_deposits(stale_before).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Startup catch-up query failed — stale BTC→Hemi deposits may remain INITIATED");
+                return Ok(());
+            }
+        };
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let anchored_at = chrono::Utc::now();
+        let mut count = 0usize;
+        for row in rows {
+            if already_anchored.contains(&row.id) {
+                continue;
+            }
+            let dest_block = match row.dest_block {
+                Some(b) => b as u64,
+                None => continue,
+            };
+            // Attribute to the keystone that should have covered this mint block.
+            let attributed_keystone = keystone_for(dest_block).min(current_keystone);
+
+            self.emit(TunnelTransferUpdate::PopAnchored {
+                id: row.id,
+                keystone_block: attributed_keystone,
+                pop_score: 0,
+                anchored_at,
+            }).await?;
+            count += 1;
+        }
+
+        if count > 0 {
+            info!(
+                count,
+                current_keystone,
+                "Startup catch-up: anchored stale BTC→Hemi deposits whose keystones fired before this session"
+            );
+        }
         Ok(())
     }
 
@@ -398,6 +507,50 @@ impl JoinEngine {
             }).await?;
         }
 
+        Ok(())
+    }
+
+    /// DB-backed fallback for `TunnelRelease` events that arrive after a node restart.
+    ///
+    /// When the node restarts, `pending_hemi_burns` in the matcher is empty, so a
+    /// `TunnelRelease` that pairs with a burn from a previous session would otherwise
+    /// be silently dropped. This fallback queries the DB for any HEMI_TO_ETH withdrawal
+    /// in INITIATED status that matches the release recipient + amount, and finalizes it.
+    async fn handle_unmatched_eth_release(&self, eth: &EthereumEvent) -> Result<()> {
+        let EthereumEvent::TunnelRelease { tx_hash, to, amount, block_number, block_time, gas_fee, .. } = eth
+        else { return Ok(()); };
+
+        let Some(db) = &self.db else { return Ok(()); };
+        let repo = TunnelTransferRepo::new(db);
+        let recipient = to.to_string();
+
+        match repo.find_pending_eth_withdrawal(&recipient, amount).await {
+            Ok(Some(row)) => {
+                info!(
+                    transfer_id = %row.id,
+                    dest_tx = %tx_hash,
+                    "TunnelRelease matched via DB fallback — finalizing HEMI_TO_ETH withdrawal"
+                );
+                self.emit(TunnelTransferUpdate::EthWithdrawalFinalized {
+                    id: row.id,
+                    dest_tx_hash: tx_hash.to_string(),
+                    dest_block: Some(*block_number as i64),
+                    dest_fee: gas_fee.clone(),
+                    finalized_at: *block_time,
+                })
+                .await?;
+            }
+            Ok(None) => {
+                debug!(
+                    recipient = %recipient,
+                    dest_tx = %tx_hash,
+                    "TunnelRelease: no matching HEMI_TO_ETH withdrawal in DB — ignoring"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "DB-backed ETH withdrawal finalization fallback failed");
+            }
+        }
         Ok(())
     }
 
@@ -534,8 +687,11 @@ fn transfer_from_hemi_event(event: &HemiEvent) -> Option<TunnelTransfer> {
             // An ETH/ERC-20 deposit finalizing on Hemi means the funds have arrived —
             // the transfer is complete. A BTC mint is only INITIATED until a PoP
             // keystone anchors it to Bitcoin.
+            // BTC→Hemi and ETH→Hemi: FINALIZED as soon as the Hemi mint is confirmed.
+            // The user has their funds; PoP anchoring is tracked separately via pop_anchored.
+            // HEMI_TO_BTC and HEMI_TO_ETH withdrawals remain INITIATED until payout/release.
             let (status, finalized_at) = match route {
-                TunnelRoute::EthToHemi => (TunnelStatus::Finalized, Some(now)),
+                TunnelRoute::BtcToHemi | TunnelRoute::EthToHemi => (TunnelStatus::Finalized, Some(now)),
                 _ => (TunnelStatus::Initiated, None),
             };
 
@@ -664,6 +820,7 @@ fn enrich_with_eth_leg(t: &mut TunnelTransfer, eth: &EthereumEvent) {
             t.status = TunnelStatus::Finalized;
             t.finalized_at = Some(*block_time);
         }
+        EthereumEvent::WithdrawalProven { .. } => {}
         EthereumEvent::BlockReorg { .. } => {}
     }
 }

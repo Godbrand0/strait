@@ -275,6 +275,18 @@ sol! {
 // ============================================================================
 
 sol! {
+    /// SimpleBitcoinVault — one vault contract per Bitcoin custody address on Hemi.
+    /// The BTC payout watcher calls currentSweepUTXO() to detect BTC payouts
+    /// without requiring the UTXO to remain unspent.
+    interface ISimpleBitcoinVault {
+        /// The Bitcoin txid (bytes32) of the most recent sweep transaction confirmed
+        /// by the vault operator via finalizeWithdrawal(). Returns zero if no sweep
+        /// has been processed yet.
+        function currentSweepUTXO() external view returns (bytes32);
+    }
+}
+
+sol! {
     /// BitcoinKitV1 — read-only precompile exposing Bitcoin state on Hemi.
     interface IBitcoinKitV1 {
 
@@ -644,6 +656,7 @@ mod tests {
             topics::erc20_bridge_initiated(),
             topics::deposit_confirmed(),
             topics::btc_withdrawal_initiated(),
+            topics::withdrawal_challenge_success(),
             topics::vault_created(),
             topics::payout_round_executed(),
         ];

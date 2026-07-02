@@ -76,7 +76,12 @@ async fn main() -> anyhow::Result<()> {
         Some(url) => build_provider(url).context("invalid HEMI_BITCOIN_KIT_RPC_URL")?,
         None => hemi_provider.clone(),
     };
-    let payout_kit_provider = bitcoin_kit_provider.clone();
+    // Payout watcher gets its own provider so custody watcher and payout watcher
+    // hit independent rate-limit pools. Falls back to bitcoin_kit_provider if unset.
+    let payout_kit_provider: Arc<dyn Provider> = match &config.bitcoin.payout_kit_rpc_url {
+        Some(url) => build_provider(url).context("invalid HEMI_PAYOUT_KIT_RPC_URL")?,
+        None => bitcoin_kit_provider.clone(),
+    };
     let hemi_ingester = EvmIngester::new(
         config.hemi.clone(),
         Chain::Hemi,
@@ -129,8 +134,15 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         let interval = config.bitcoin.poll_interval_secs;
         let confs = config.bitcoin.confirmation_depth;
+        let vault_contracts: Vec<alloy::primitives::Address> = config.bitcoin.vault_contracts
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if vault_contracts.is_empty() {
+            warn!("HEMI_VAULT_CONTRACTS not set — vault sweep detection disabled (Phase 3)");
+        }
         tasks.spawn(async move {
-            let watcher = payout_watcher::BtcPayoutWatcher::new(caller, payout_kit_provider, db, interval, confs);
+            let watcher = payout_watcher::BtcPayoutWatcher::new(caller, payout_kit_provider, db, interval, confs, vault_contracts);
             if let Err(e) = watcher.run().await {
                 error!("BTC payout watcher exited: {e}");
             }

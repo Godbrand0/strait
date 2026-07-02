@@ -33,13 +33,23 @@ pub struct BitcoinConfig {
     /// Poll interval in seconds for checking new blocks
     #[serde(default = "default_bitcoin_poll_interval")]
     pub poll_interval_secs: u64,
-    /// Separate Hemi RPC URL used exclusively for BitcoinKit precompile calls
-    /// (getUTXOsForBitcoinAddress, getTransactionOutputsByTxId, etc.).
-    /// Defaults to HEMI_RPC_URL if unset, but should be set to the public Hemi RPC
-    /// (https://rpc.hemi.network/rpc) to avoid burning premium-endpoint quota on
-    /// read-only precompile eth_call requests.
+    /// Hemi RPC URL used exclusively by the custody watcher BitcoinKit precompile calls
+    /// (getUTXOsForBitcoinAddress). Defaults to HEMI_RPC_URL if unset.
+    /// Set via HEMI_BITCOIN_KIT_RPC_URL.
     #[serde(default)]
     pub bitcoin_kit_rpc_url: Option<String>,
+    /// Separate Hemi RPC URL used exclusively by the payout watcher BitcoinKit calls
+    /// (getUTXOsForBitcoinAddress, getTransactionByTxId, currentSweepUTXO).
+    /// Defaults to bitcoin_kit_rpc_url → HEMI_RPC_URL if unset.
+    /// Set via HEMI_PAYOUT_KIT_RPC_URL to spread load across endpoints.
+    #[serde(default)]
+    pub payout_kit_rpc_url: Option<String>,
+    /// Ordered list of SimpleBitcoinVault contract addresses on Hemi (index 0 first).
+    /// Used by the payout watcher to call currentSweepUTXO() per vault, detecting
+    /// BTC payouts without depending on UTXO availability.
+    /// Set via HEMI_VAULT_CONTRACTS (comma-separated EVM addresses).
+    #[serde(default)]
+    pub vault_contracts: Vec<String>,
 }
 
 /// EVM chain configuration (used for both Hemi and Ethereum)
@@ -238,6 +248,12 @@ impl AppConfig {
                     default_bitcoin_poll_interval(),
                 ),
                 bitcoin_kit_rpc_url: env_opt("HEMI_BITCOIN_KIT_RPC_URL"),
+                payout_kit_rpc_url: env_opt("HEMI_PAYOUT_KIT_RPC_URL"),
+                vault_contracts: env_str("HEMI_VAULT_CONTRACTS")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             },
             hemi: EvmChainConfig {
                 rpc_url: env_str("HEMI_RPC_URL"),

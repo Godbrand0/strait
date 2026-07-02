@@ -171,7 +171,8 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
-    /// Record PoP anchoring on a transfer and advance it to ANCHORED.
+    /// Record PoP anchoring on a transfer. Sets the pop_* fields; does not change
+    /// status (BTC→Hemi deposits are already FINALIZED before PoP fires).
     pub async fn set_pop_anchor(
         &self,
         id: Uuid,
@@ -185,7 +186,6 @@ impl<'a> TunnelTransferRepo<'a> {
                  pop_keystone_block = $2,
                  pop_score = $3,
                  pop_anchored_at = $4,
-                 status = 'ANCHORED',
                  updated_at = NOW()
              WHERE id = $1",
         )
@@ -199,8 +199,56 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
-    /// Find a Hemi→ETH withdrawal in INITIATED status matching the Ethereum recipient
-    /// address and exact amount — used by the DB-backed finalization fallback.
+    /// Find the oldest INITIATED HEMI_TO_ETH withdrawal for a recipient address —
+    /// used when `WithdrawalProven` fires to advance the transfer to PROVING.
+    ///
+    /// `WithdrawalProven` carries no amount, so matching is by recipient only.
+    /// FIFO ordering (ASC by initiated_at) handles same-user concurrent withdrawals.
+    pub async fn find_eth_withdrawal_for_proving(
+        &self,
+        recipient: &str,
+    ) -> Result<Option<TunnelTransferRow>> {
+        let row = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_ETH'
+               AND status = 'INITIATED'
+               AND lower(recipient) = lower($1)
+             ORDER BY initiated_at ASC
+             LIMIT 1",
+        )
+        .bind(recipient)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(row)
+    }
+
+    /// Advance a HEMI_TO_ETH withdrawal to PROVING once its withdrawal has been
+    /// proven on the OptimismPortal (1-day challenge window now open).
+    /// The `WHERE status = 'INITIATED'` guard makes this idempotent.
+    pub async fn set_eth_withdrawal_proving(
+        &self,
+        id: Uuid,
+        proven_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE tunnel_transfers
+             SET status     = 'PROVING',
+                 updated_at = $2
+             WHERE id = $1
+               AND status = 'INITIATED'",
+        )
+        .bind(id)
+        .bind(proven_at)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
+    /// Find a Hemi→ETH withdrawal in INITIATED or PROVING status matching the
+    /// Ethereum recipient address and exact amount — used by the DB-backed
+    /// finalization fallback when ETHBridgeFinalized fires on L1.
     ///
     /// Returns the oldest matching transfer (ASC by initiated_at) so that repeated
     /// withdrawals of the same amount are finalized in initiation order.
@@ -212,7 +260,7 @@ impl<'a> TunnelTransferRepo<'a> {
         let row = sqlx::query_as::<_, TunnelTransferRow>(
             "SELECT * FROM tunnel_transfers
              WHERE route = 'HEMI_TO_ETH'
-               AND status = 'INITIATED'
+               AND status IN ('INITIATED', 'PROVING')
                AND lower(recipient) = lower($1)
                AND amount = $2
              ORDER BY initiated_at ASC
@@ -271,7 +319,7 @@ impl<'a> TunnelTransferRepo<'a> {
         let rows = sqlx::query_as::<_, TunnelTransferRow>(
             "SELECT * FROM tunnel_transfers
              WHERE route = 'BTC_TO_HEMI'
-               AND status = 'INITIATED'
+               AND pop_anchored = FALSE
                AND dest_chain = 'HEMI'
                AND dest_block > $1
                AND dest_block <= $2",
@@ -282,6 +330,47 @@ impl<'a> TunnelTransferRepo<'a> {
         .await
         .map_err(StraitError::Database)?;
         Ok(rows)
+    }
+
+    /// Find BTC→Hemi deposits not yet PoP-anchored whose mint block is strictly before
+    /// `before_block` — meaning their keystone window has already passed without being
+    /// caught by the in-session or per-keystone DB fallback (e.g. the node was down when
+    /// the keystone fired). Used by the startup catch-up to retroactively set pop fields.
+    pub async fn list_stale_initiated_btc_deposits(
+        &self,
+        before_block: i64,
+    ) -> Result<Vec<TunnelTransferRow>> {
+        let rows = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'BTC_TO_HEMI'
+               AND pop_anchored = FALSE
+               AND dest_chain = 'HEMI'
+               AND dest_block IS NOT NULL
+               AND dest_block <= $1",
+        )
+        .bind(before_block)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// Find an INITIATED HEMI_TO_BTC withdrawal by its on-chain uuid.
+    /// Used by the join engine to mark a withdrawal FAILED when
+    /// `WithdrawalChallengeSuccess` fires (operator did not pay on time).
+    pub async fn find_initiated_btc_withdrawal_by_uuid(&self, uuid: i64) -> Result<Option<TunnelTransferRow>> {
+        let row = sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_BTC'
+               AND status = 'INITIATED'
+               AND withdrawal_uuid = $1
+             LIMIT 1",
+        )
+        .bind(uuid)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(row)
     }
 
     /// List Hemi→BTC withdrawals whose BTC address recovery failed at indexing time —
@@ -467,6 +556,28 @@ impl<'a> TunnelTransferRepo<'a> {
             .map_err(StraitError::Database)?;
         Ok(row.0)
     }
+
+    /// Per-status counts across all indexed transfers.
+    pub async fn count_by_status(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, COUNT(*)::bigint FROM tunnel_transfers GROUP BY status",
+        )
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Number of transfers that have been PoP-anchored to Bitcoin.
+    pub async fn count_pop_anchored(&self) -> Result<i64> {
+        let row = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*)::bigint FROM tunnel_transfers WHERE pop_anchored = true",
+        )
+        .fetch_one(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(row.0)
+    }
 }
 
 /// Serialize a `BigDecimal` as a plain integer string (e.g. "130000000000000000")
@@ -495,6 +606,7 @@ pub fn status_str(status: &TunnelStatus) -> &'static str {
     match status {
         TunnelStatus::Initiated => "INITIATED",
         TunnelStatus::Anchored => "ANCHORED",
+        TunnelStatus::Proving => "PROVING",
         TunnelStatus::Finalized => "FINALIZED",
         TunnelStatus::Failed { .. } => "FAILED",
         TunnelStatus::Reorged { .. } => "REORGED",

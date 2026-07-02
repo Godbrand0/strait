@@ -426,6 +426,31 @@ impl EvmIngester {
                     ).await?;
                 }
             }
+        } else if topic0 == topics::withdrawal_challenge_success() {
+            // WithdrawalChallengeSuccess(indexed vault, indexed withdrawer, indexed uuid)
+            // Operator failed to pay within the deadline — hBTC re-minted to withdrawer.
+            // uuid is indexed (uint64 in topic[3]).
+            if let Some(withdrawer_t) = log_topics.get(2) {
+                let withdrawer = addr_from_topic(withdrawer_t);
+                let uuid = log_topics.get(3)
+                    .map(|t| u64::from_be_bytes(t.0[24..32].try_into().unwrap_or([0u8; 8])))
+                    .unwrap_or(0);
+                info!(
+                    uuid,
+                    withdrawer = %hex::encode(withdrawer.0),
+                    tx = %hex::encode(tx_hash.0),
+                    "WithdrawalChallengeSuccess — operator failed to pay, withdrawal FAILED"
+                );
+                self.event_tx.send(RawEvent::Hemi(HemiEvent::WithdrawalChallengeSuccess {
+                    uuid,
+                    withdrawer,
+                    tx_hash: TxHash(tx_hash.0),
+                    block_number: block_num,
+                    block_time,
+                    log_index,
+                })).await.map_err(|_| StraitError::Internal("event channel closed".into()))?;
+            }
+
         // ── PoPPayoutsV2 events ────────────────────────────────────────────────
 
         } else if topic0 == topics::payout_round_executed() {

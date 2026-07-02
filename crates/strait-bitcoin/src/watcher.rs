@@ -124,9 +124,10 @@ impl BitcoinKitCaller {
 
     /// Read the OP_RETURN payload from a Bitcoin transaction by txid.
     ///
-    /// Uses `getTransactionByTxId` and scans its outputs for `isOpReturn == true`.
-    /// Returns the raw `script` bytes from the first matching output, or `None`
-    /// if the transaction has no OP_RETURN output.
+    /// Uses `getTransactionByTxId` and scans its outputs for `isOpReturn == true`
+    /// OR a script starting with `0x6a` (the OP_RETURN opcode). The script-prefix
+    /// fallback guards against BitcoinKit bugs where `isOpReturn` is not set even
+    /// though the output is genuinely OP_RETURN (observed in vault sweep txs on mainnet).
     pub async fn get_op_return_data(&self, txid: &BitcoinTxid) -> Result<Option<Vec<u8>>> {
         let call = IBitcoinKitV1::getTransactionByTxIdCall { txId: B256::from(txid.0) };
         let result = self.call(call.abi_encode()).await?;
@@ -134,10 +135,8 @@ impl BitcoinKitCaller {
             .map_err(|e| StraitError::Parse(format!("getTransactionByTxId decode: {e}")))?
             ._0;
 
-        // Pass output.script (the full OP_RETURN script including 0x6a prefix) to
-        // parse_hemi_destination — the vault parses the script, not opReturnData.
         for output in tx.outputs {
-            if output.isOpReturn {
+            if output.isOpReturn || output.script.first() == Some(&0x6a) {
                 return Ok(Some(output.script.to_vec()));
             }
         }
@@ -263,13 +262,22 @@ impl CustodyWatcher {
     /// pre-existing deposits already captured by the Hemi EVM ingester via
     /// DepositConfirmed. Marking them seen upfront avoids a burst of
     /// getTransactionByTxId calls on startup that would saturate the rate limit.
-    async fn initialize_seen(&mut self) {
+    ///
+    /// Returns true only if ALL addresses were successfully seeded. On partial
+    /// failure (any 429/error), returns false so the next poll retries the init
+    /// rather than treating unseeded addresses' UTXOs as new deposits.
+    async fn initialize_seen(&mut self) -> bool {
+        let mut all_ok = true;
         let mut total = 0usize;
         for addr in &self.addresses.clone() {
+            // Pace seed calls: 400ms gap = 2.5 calls/sec, well under the 300 req/min
+            // (5 req/s) public Hemi RPC limit even when the EVM ingester fires concurrently.
+            tokio::time::sleep(Duration::from_millis(400)).await;
             let utxos = match self.caller.get_utxos_for_address(addr).await {
                 Ok(u) => u,
                 Err(e) => {
-                    warn!(address = %addr, error = %e, "Seed-seen UTXO fetch failed — will retry processing on next poll");
+                    warn!(address = %addr, error = %e, "Seed-seen UTXO fetch failed — will retry on next poll");
+                    all_ok = false;
                     continue;
                 }
             };
@@ -278,14 +286,24 @@ impl CustodyWatcher {
             }
             total += utxos.len();
         }
-        info!(utxos_skipped = total, "Custody watcher initialized — pre-existing UTXOs marked seen, watching for new deposits only");
-        self.initialized = true;
+        if all_ok {
+            info!(utxos_skipped = total, "Custody watcher initialized — pre-existing UTXOs marked seen, watching for new deposits only");
+            self.initialized = true;
+        } else {
+            warn!(seeded_so_far = total, "Seed-seen incomplete — retrying failed addresses on next poll");
+        }
+        all_ok
     }
 
     /// Poll all watched addresses and return any new UTXOs not yet seen.
     pub async fn poll_new_deposits(&mut self) -> Result<Vec<DepositCandidate>> {
         if !self.initialized {
+            // Run seed-seen and always return early this cycle — success or not.
+            // On success, the 60s poll sleep separates seed-seen from the first
+            // real poll, preventing a 14-call burst (7 seed + 7 poll back-to-back)
+            // that trips the 300 req/min rate limit. On failure, we retry next cycle.
             self.initialize_seen().await;
+            return Ok(Vec::new());
         }
 
         let mut candidates = Vec::new();
@@ -294,6 +312,9 @@ impl CustodyWatcher {
         let tip_height = self.caller.get_tip_height().await.unwrap_or(0);
 
         for addr in &self.addresses.clone() {
+            // Pace the 7 UTXO-list calls to avoid a burst that overlaps with the
+            // Hemi EVM ingester and exceeds the 300 req/min rolling rate limit.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             // One bad/invalid custody address must not fail the whole poll —
             // log it and move on to the others.
             let utxos = match self.caller.get_utxos_for_address(addr).await {
