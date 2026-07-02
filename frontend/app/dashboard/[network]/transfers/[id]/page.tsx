@@ -108,7 +108,7 @@ export default async function TransferDetailPage({
             <Field label="Recipient" value={shortHash(t.recipient)} mono copyValue={t.recipient} />
             <div className="h-px bg-white/[0.06]" />
             <TxField
-              label="Source"
+              label="Source Tx"
               chain={t.sourceChain}
               hash={sourceObserved(t) ? t.sourceTxHash : null}
               block={sourceObserved(t) ? t.sourceBlock : null}
@@ -116,7 +116,7 @@ export default async function TransferDetailPage({
               network={network}
             />
             <TxField
-              label="Destination"
+              label="Destination Tx"
               chain={t.destChain}
               hash={t.destTxHash}
               block={t.destBlock}
@@ -173,10 +173,30 @@ function buildTimeline(t: Transfer): Step[] {
   }
 
   // Outbound (withdrawal from Hemi)
+  const burned: Step = { title: "Burned on Hemi", chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true };
+
+  // HEMI_TO_ETH: 3-phase OP Stack withdrawal (burn → prove → release)
+  if (t.route === "HEMI_TO_ETH") {
+    const proven = t.status !== "INITIATED";
+    return [
+      burned,
+      {
+        title: "Proven on Ethereum L1",
+        chain: "ETHEREUM",
+        hash: null,
+        block: null,
+        done: proven,
+        detail: proven ? "1-day challenge window started" : "Submit proof on the Hemi bridge to begin",
+      },
+      { title: "Released on Ethereum", chain: t.destChain, hash: t.destTxHash, block: t.destBlock, done: t.destTxHash != null },
+      finalStep,
+    ];
+  }
+
   return [
-    { title: "Burned on Hemi", chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true },
+    burned,
     {
-      title: t.destChain === "BITCOIN" ? "Paid out on Bitcoin" : "Released on destination",
+      title: "Paid out on Bitcoin",
       chain: t.destChain,
       hash: t.destTxHash,
       block: t.destBlock,

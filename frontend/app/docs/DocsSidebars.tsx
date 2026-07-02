@@ -8,7 +8,6 @@ const NAV = [
   { id: "lifecycle", label: "Lifecycle" },
   { id: "api", label: "Using the API" },
   { id: "contracts", label: "Contracts" },
-  { id: "self-host", label: "Self-host" },
 ];
 
 const TOC = [
@@ -24,7 +23,6 @@ const TOC = [
   { id: "api-graphql", label: "GraphQL queries", level: 3 },
   { id: "api-examples", label: "Examples", level: 3 },
   { id: "contracts", label: "Contracts", level: 2 },
-  { id: "self-host", label: "Self-host", level: 2 },
 ];
 
 const IDS = TOC.map((h) => h.id);
