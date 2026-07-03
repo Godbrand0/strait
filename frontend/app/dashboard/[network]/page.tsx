@@ -109,8 +109,8 @@ export default async function DashboardPage({
                   <th className="font-medium px-4 py-3">Route</th>
                   <th className="font-medium px-4 py-3">Amount</th>
                   <th className="font-medium px-4 py-3">Status</th>
-                  <th className="font-medium px-4 py-3">Bitcoin-final</th>
-                  <th className="font-medium px-4 py-3">Recipient</th>
+                  <th className="font-medium px-4 py-3">From</th>
+                  <th className="font-medium px-4 py-3">To</th>
                   <th className="font-medium px-4 py-3 text-right">Age →</th>
                 </tr>
               </thead>
