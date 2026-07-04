@@ -327,3 +327,28 @@ interface IBitcoinKit {
 | 8 | `0x58f7B8D7A7291AaECE0FEbb39aA4E877387e61E4` | `1QDhzsteETKuw1M5kWHEjzaAmHSGhpH8zr` |
 
 These 7 unique custody addresses are configured in `BITCOIN_TUNNEL_ADDRESSES` in `.env`. See [`docs/btc-tunnel-guide.md`](btc-tunnel-guide.md) for details on how the `CustodyWatcher` uses them.
+
+---
+
+## SimpleBitcoinVault — payout detection interface
+
+Each vault contract exposes `currentSweepUTXO()`, which returns the Bitcoin txid of the most recently confirmed withdrawal sweep. Strait's `BtcPayoutWatcher` uses this to finalize Hemi→BTC withdrawals when the payout UTXO has already been spent.
+
+```solidity
+interface ISimpleBitcoinVault {
+    /// Returns the Bitcoin txid (bytes32) of the most recent sweep transaction
+    /// confirmed by the vault operator via finalizeWithdrawal().
+    /// Returns zero (bytes32(0)) if no sweep has been processed yet.
+    function currentSweepUTXO() external view returns (bytes32);
+}
+```
+
+Selector: `0xe9beef3d`
+
+Configure via `HEMI_VAULT_CONTRACTS` in `.env` — a comma-separated list of vault EVM addresses in vault-index order (index 0 first):
+
+```env
+HEMI_VAULT_CONTRACTS=0x3da10b74...,0xecf9c248...,0x13ca60fe,...
+```
+
+If `HEMI_VAULT_CONTRACTS` is empty or unset, Phase 3 sweep detection is disabled and only Phase 2 UTXO polling runs.

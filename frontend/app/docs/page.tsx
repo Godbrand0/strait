@@ -4,7 +4,7 @@ import DocsSidebars from "./DocsSidebars";
 export const metadata = {
   title: "Strait — Docs",
   description:
-    "Developer documentation for Strait: the project, the read API (GraphQL + REST), the data model, the contract addresses it indexes, and how to run your own node.",
+    "Developer documentation for Strait: the project, the read API (GraphQL + REST), the data model, and the contract addresses it indexes.",
 };
 
 export default function DocsPage() {
@@ -20,7 +20,6 @@ export default function DocsPage() {
           <Lifecycle />
           <UsingTheApi />
           <Contracts />
-          <SelfHost />
           <Footer />
         </main>
       </div>
@@ -76,7 +75,6 @@ function Hero() {
           ["Lifecycle", "lifecycle"],
           ["Using the API", "api"],
           ["Contracts", "contracts"],
-          ["Self-host", "self-host"],
         ].map(([label, id]) => (
           <a
             key={id}
@@ -121,7 +119,7 @@ function DataModel() {
     ["route", "Enum", "BTC_TO_HEMI · HEMI_TO_BTC · ETH_TO_HEMI · HEMI_TO_ETH."],
     ["amount", "String", "Atomic units (satoshis or wei) as a decimal string."],
     ["sender / recipient", "String", "Origin / destination address (EVM 0x… or Bitcoin)."],
-    ["status", "Enum", "INITIATED · ANCHORED · FINALIZED · FAILED · REORGED."],
+    ["status", "Enum", "INITIATED · PROVING · FINALIZED · FAILED · REORGED."],
     ["sourceChain / sourceTxHash / sourceBlock", "—", "The initiating leg."],
     ["destChain / destTxHash / destBlock", "—", "The counterpart leg (null until it confirms)."],
     ["popAnchored / popKeystoneBlock / popScore", "—", "Bitcoin (PoP) anchoring fields."],
@@ -199,7 +197,7 @@ function Lifecycle() {
         <h3 className="text-base font-semibold text-white">
           BTC → Hemi <span className="ml-2 text-xs font-normal text-zinc-500">deposit · ~1–2 hours</span>
         </h3>
-        <Pre>{`INITIATED ──► ANCHORED ────────────────────────────► FINALIZED`}</Pre>
+        <Pre>{`INITIATED ──────────────────────────────────────────► FINALIZED`}</Pre>
         <ol className="space-y-3 text-sm text-zinc-300">
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
@@ -211,16 +209,16 @@ function Lifecycle() {
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
             <div>
-              <span className="font-medium text-white">6 Bitcoin confirmations accumulate <span className="font-normal text-zinc-500">(~1 hour)</span></span>
-              <p className="mt-0.5 text-zinc-400">An operator calls <Code>confirmDeposit</Code> on BitcoinTunnelManager, minting hBTC. Strait sees <Code>DepositConfirmed</Code> and enriches the transfer with the Hemi destination.</p>
+              <span className="font-medium text-white">6 Bitcoin confirmations accumulate, hBTC is minted <span className="font-normal text-zinc-500">(~1 hour)</span></span>
+              <p className="mt-0.5 text-zinc-400">An operator calls <Code>confirmDeposit</Code> on BitcoinTunnelManager, minting hBTC to the recipient. Strait sees <Code>DepositConfirmed</Code> and advances to <Code>FINALIZED</Code> — the user has their funds.</p>
             </div>
           </li>
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">3</span>
             <div>
-              <span className="font-medium text-white">PoP keystone anchors the Hemi block <span className="font-normal text-zinc-500">(every ~5 min)</span></span>
-              <p className="mt-0.5 text-zinc-400"><Code>PoPPayoutsV2.PayoutRoundExecuted</Code> fires for the keystone block covering the mint. Strait advances to <Code>ANCHORED</Code>, then immediately <Code>FINALIZED</Code> — the transfer now carries Bitcoin-grade finality.</p>
-              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of June 2026. Transfers will sit at <Code>INITIATED</Code> until the Hemi team calls <Code>mintPoPRewards()</Code> for the first time.</p>
+              <span className="font-medium text-white">PoP keystone anchors the Hemi block <span className="font-normal text-zinc-500">(async, ~90 min — optional)</span></span>
+              <p className="mt-0.5 text-zinc-400"><Code>PoPPayoutsV2.PayoutRoundExecuted</Code> fires for the keystone covering the mint block. <Code>status</Code> stays <Code>FINALIZED</Code>; Strait sets <Code>popAnchored=true</Code>. This upgrades the transfer to Bitcoin-grade finality independently of <Code>FINALIZED</Code>.</p>
+              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of June 2026. <Code>popAnchored</Code> stays false, but transfers still reach <Code>FINALIZED</Code> at mint.</p>
             </div>
           </li>
         </ol>
@@ -263,7 +261,7 @@ function Lifecycle() {
         <h3 className="text-base font-semibold text-white">
           Hemi → BTC <span className="ml-2 text-xs font-normal text-zinc-500">withdrawal · ~2–14 hours</span>
         </h3>
-        <Pre>{`INITIATED ──► ANCHORED ────────────────────────────► FINALIZED`}</Pre>
+        <Pre>{`INITIATED ──────────────────────────────────────────► FINALIZED`}</Pre>
         <ol className="space-y-3 text-sm text-zinc-300">
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
@@ -275,16 +273,9 @@ function Lifecycle() {
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
             <div>
-              <span className="font-medium text-white">PoP keystone anchors the withdrawal <span className="font-normal text-zinc-500">(every ~5 min)</span></span>
-              <p className="mt-0.5 text-zinc-400">The Hemi burn block is covered by a keystone. Strait advances to <Code>ANCHORED</Code> — the withdrawal is now committed to Bitcoin.</p>
-              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of June 2026. Transfers will sit at <Code>INITIATED</Code> until the Hemi team activates the system.</p>
-            </div>
-          </li>
-          <li className="flex gap-3">
-            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">3</span>
-            <div>
               <span className="font-medium text-white">Vault operator pays out on Bitcoin <span className="font-normal text-zinc-500">(up to ~14 hours)</span></span>
               <p className="mt-0.5 text-zinc-400">The operator broadcasts a Bitcoin transaction with the uuid in an <Code>OP_RETURN</Code> output. Strait matches it by uuid and advances to <Code>FINALIZED</Code>.</p>
+              <p className="mt-1 text-zinc-500 text-xs">If the operator misses the deadline, anyone can call <Code>challengeWithdrawal</Code> on <Code>BitcoinTunnelManager</Code>. On success, the contract re-mints hBTC to the original sender and Strait marks the transfer <Code>FAILED</Code>.</p>
             </div>
           </li>
         </ol>
@@ -410,45 +401,12 @@ function Contracts() {
       <Callout>
         <strong>PoP anchoring status (June 2026):</strong> The <Code>PoPPayoutsV2</Code>{" "}
         contracts are deployed on mainnet but <Code>mintPoPRewards()</Code> has not yet been
-        called — <Code>lastBlockRewarded = 0</Code> on both deployments. BTC route transfers
-        will remain in <Code>INITIATED</Code> until the Hemi team activates PoP payouts.
-        Strait is wired and will advance transfers to <Code>ANCHORED</Code> automatically
-        once <Code>PayoutRoundExecuted</Code> events start firing.
+        called — <Code>lastBlockRewarded = 0</Code> on both deployments.{" "}
+        <Code>BTC_TO_HEMI</Code> deposits already reach <Code>FINALIZED</Code> at the Hemi
+        mint — PoP anchoring is tracked separately via <Code>popAnchored</Code>. Strait will
+        set <Code>popAnchored=true</Code> automatically once{" "}
+        <Code>PayoutRoundExecuted</Code> events start firing.
       </Callout>
-    </Section>
-  );
-}
-
-function SelfHost() {
-  return (
-    <Section id="self-host" title="Run your own node">
-      <p>
-        Strait is open source and self-hostable. State lives in Postgres/Supabase, so the node
-        is a stateless worker that resumes from its checkpoint on restart.
-      </p>
-      <Pre>{`git clone https://github.com/Godbrand0/strait
-cd strait && cp .env.example .env
-
-# Minimum required — everything else has sensible defaults:
-#
-# HEMI_RPC_URL=https://rpc.hemi.network/rpc
-# ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-# DATABASE_URL=postgres://...
-#
-# PoP anchoring (BTC route finality):
-# HEMI_POP_PAYOUTS_CONTRACT=0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b
-#
-# Bitcoin custody watcher — enables early deposit detection:
-# BITCOIN_TUNNEL_ADDRESSES=18AVmm853HVhibPHMc3JRLXMynzKAbj6Po,...
-
-cargo run -p strait-node
-
-# GraphQL:    http://localhost:8080/graphql
-# Playground: open the same URL in a browser`}</Pre>
-      <p className="text-zinc-400">
-        For testnet, use <Code>.env.testnet.example</Code> (Hemi Sepolia + Ethereum Sepolia)
-        and a separate database.
-      </p>
     </Section>
   );
 }

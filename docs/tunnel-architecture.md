@@ -71,12 +71,22 @@ Hemi blockchain
    → WithdrawalInitiated event emitted (uuid = vaultIndex << 32 | vaultSpecificUUID)
 
 2. Vault operator sends BTC to the user's Bitcoin address.
-   Payout tx must include an OP_RETURN encoding the uuid.
+   Payout tx includes an OP_RETURN encoding the 4-byte vault-specific uuid.
 
-3. If operator does not pay within the deadline, user calls:
+3. Operator calls SimpleBitcoinVault.finalizeWithdrawal(txid, withdrawalIndex)
+   → Records the Bitcoin txid in vault state (currentSweepUTXO).
+   → No event is emitted — state change only.
+
+4. If operator does not pay within the deadline, user calls:
    BitcoinTunnelManager.challengeWithdrawal(uuid, extraInfo)
    → On success: hBTC re-minted to original withdrawer.
 ```
+
+**Indexer note:** Because `finalizeWithdrawal` emits no events, Strait detects payouts via two polling phases in `BtcPayoutWatcher`:
+- **Phase 2**: BitcoinKit UTXO scan on recipient address (works while UTXO is unspent)
+- **Phase 3**: `currentSweepUTXO()` call on each vault contract (works regardless of UTXO state)
+
+See [`btc-tunnel-guide.md`](btc-tunnel-guide.md) for the full finalization flow.
 
 ### Events to index
 
