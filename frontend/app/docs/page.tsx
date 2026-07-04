@@ -352,8 +352,13 @@ curl 'http://localhost:8080/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'`}</P
 
       <Callout>
         <strong>Polling for finality:</strong> there&apos;s no subscription/webhook endpoint
-        yet — poll <Code>transfersByRecipient</Code> every ~10–15s and stop when{" "}
-        <Code>status === &quot;FINALIZED&quot;</Code>.
+        yet — poll. If you know your source tx hash (you always do — you just submitted
+        it), use <Code>searchTransfers(query: &quot;0xyourtxhash&quot;)</Code> every
+        ~10–15s rather than matching by amount/route/time — it finds your transfer
+        directly instead of guessing. Fall back to <Code>transfersByRecipient</Code> only
+        if you don&apos;t have a tx hash yet. Stop when{" "}
+        <Code>status === &quot;FINALIZED&quot;</Code> (or <Code>FAILED</Code> /{" "}
+        <Code>REORGED</Code>).
       </Callout>
     </Section>
   );
