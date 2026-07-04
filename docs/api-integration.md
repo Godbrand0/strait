@@ -170,8 +170,13 @@ These reflect what is reliably populated **today**:
   reaches `FINALIZED` at mint, and `popAnchored` upgrades to `true` independently when
   the keystone fires. If PoP is not yet active on the network, `popAnchored` stays
   `false` but `status` is still `FINALIZED`.
-- **Withdrawals** stay `INITIATED` until their destination leg is matched (ETH
-  withdrawals also wait out the ~7-day OP-Stack challenge window).
+- **Withdrawals** stay `INITIATED` until their destination leg is matched. ETH
+  withdrawals go through two on-chain steps before `FINALIZED`: someone must call
+  `proveWithdrawalTransaction` on Ethereum (advances to `PROVING` — Strait does not do
+  this automatically, and an un-proven withdrawal waits indefinitely, not just ~1 day),
+  then Hemi's ~1 day challenge window elapses (shortened from the standard OP Stack
+  7 days by anchoring finality to Bitcoin via PoP) before `finalizeWithdrawalTransaction`
+  releases the funds.
 
 ---
 
@@ -180,11 +185,22 @@ These reflect what is reliably populated **today**:
 There is **no subscription/webhook endpoint yet** — poll. Recommended pattern:
 
 ```
-1. Submit a bridge tx; compute/record nothing special — just the recipient address.
-2. Poll transfersByRecipient(recipient) every ~10–15s.
-3. Find your transfer (match on amount + route + recent initiatedAt, or store its id).
-4. Stop when status == FINALIZED (or FAILED / REORGED).
+1. Submit a bridge tx. You already know its tx hash — use it, don't fuzzy-match.
+2. Poll searchTransfers(query: "<your source tx hash>") every ~10–15s.
+3. Stop when status == FINALIZED (or FAILED / REORGED). Cache the returned `id`
+   for any follow-up queries (e.g. transfer(id: ...)) once you have it.
 ```
+
+**Use your known tx hash, not amount + route + time matching.** `searchTransfers` does a
+substring match across `id`, `sender`, `recipient`, and both tx hashes, so
+`searchTransfers(query: "0xabc123...")` finds your transfer directly and unambiguously.
+Matching by amount/route/timestamp instead is fragile — it's the same kind of heuristic
+Strait's own cross-chain event matcher uses internally, and it's exactly the sort of thing
+that breaks when two transfers of the same amount land close together. Don't reimplement
+it client-side when you already have a better key.
+
+If you don't have a tx hash yet (e.g. you only know the user's wallet address), fall back
+to `transfersByRecipient(recipient)` and disambiguate by `initiatedAt` recency.
 
 A new transfer typically appears within seconds of finality on the source chain
 (after the indexer's confirmation buffer), so a 10–15s poll is plenty.

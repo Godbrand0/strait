@@ -133,13 +133,34 @@ This is a standard OP Stack bridge. Hemi inherits the full OP Stack bridge mecha
 
 ### Withdrawal flow (Hemi → ETH)
 
+Two steps, both requiring someone to actively submit a transaction — the challenge window
+does not start until step 2 happens, so an un-proven withdrawal can sit indefinitely.
+
 ```
 1. User calls L2StandardBridge.withdraw() on Hemi.
-   → ETHBridgeInitiated event emitted on Hemi.
+   → ETHBridgeInitiated event emitted on Hemi. hBTC/ETH burned; nothing has
+     happened on Ethereum yet.
 
-2. ~7 day challenge period (OP Stack fault proof window).
-   → ETHBridgeFinalized event emitted on Ethereum.
+2. Anyone calls OptimismPortal.proveWithdrawalTransaction(tx, l2OutputIndex,
+   outputRootProof, withdrawalProof) on Ethereum, once the L2 output root
+   covering this withdrawal's block has been posted (~1 hour after step 1).
+   → WithdrawalProven event emitted on Ethereum.
+   → The ~1 day challenge window starts here, not at step 1.
+
+3. ~1 day challenge period elapses (Hemi's fault-proof window — shortened
+   from the standard OP Stack 7 days by anchoring L2 output-root finality
+   to Bitcoin via PoP; see "PoP anchoring" below).
+
+4. Anyone calls OptimismPortal.finalizeWithdrawalTransaction(tx).
+   → WithdrawalFinalized event emitted on OptimismPortal.
+   → ETHBridgeFinalized event emitted on L1StandardBridgeProxy; funds released.
 ```
+
+**Indexer note:** Strait watches `WithdrawalProven` on `OptimismPortal` (when
+`ETH_OPT_PORTAL_CONTRACT` is configured) to advance a withdrawal from `INITIATED` to
+`PROVING`, and `ETHBridgeFinalized` on L1 to advance `PROVING` → `FINALIZED`. Strait does
+not submit the proof itself — today this is a manual step for the withdrawing user (or
+a relayer acting on their behalf).
 
 ### Events to index
 
@@ -149,6 +170,10 @@ event ETHBridgeFinalized(address indexed from, address indexed to, uint256 amoun
 event ETHBridgeInitiated(address indexed from, address indexed to, uint256 amount, bytes extraData);
 event ERC20BridgeFinalized(address indexed localToken, address indexed remoteToken, address indexed from, address to, uint256 amount, bytes extraData);
 event ERC20BridgeInitiated(address indexed localToken, address indexed remoteToken, address indexed from, address to, uint256 amount, bytes extraData);
+
+// OptimismPortal on Ethereum — the two-step withdrawal proof/finalize gate
+event WithdrawalProven(bytes32 indexed withdrawalHash, address indexed from, address indexed to);
+event WithdrawalFinalized(bytes32 indexed withdrawalHash, bool success);
 ```
 
 ---
