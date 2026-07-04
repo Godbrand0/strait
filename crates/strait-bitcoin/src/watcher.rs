@@ -341,8 +341,10 @@ impl CustodyWatcher {
 
                 // Fetch OP_RETURN data to extract the Hemi destination.
                 // On any error (including 429) mark as seen to prevent re-bursting on
-                // the next poll. These are existing UTXOs already captured via
-                // DepositConfirmed events on Hemi; they'll be retried after a restart.
+                // the next poll. This skip is permanent for the txid (a restart
+                // seeds all existing UTXOs as seen), but the transfer itself is
+                // still captured via the Hemi DepositConfirmed event — only the
+                // Bitcoin-side leg data (real BTC block, gross amount) is lost.
                 let bitcoin_txid = BitcoinTxid(txid);
                 let op_return = match self.caller.get_op_return_data(&bitcoin_txid).await {
                     Ok(v) => v,

@@ -95,6 +95,8 @@ pub struct JoinEngine {
     /// BTC→Hemi transfers whose keystone windows already passed before this session
     /// started (e.g. the node was down when the keystone fired).
     startup_catch_up_done: bool,
+    /// Last time completed transfers were evicted from in-memory state.
+    last_state_prune: chrono::DateTime<Utc>,
 }
 
 impl JoinEngine {
@@ -111,6 +113,7 @@ impl JoinEngine {
             last_anchored_keystone: 0,
             db: Some(db),
             startup_catch_up_done: false,
+            last_state_prune: Utc::now(),
         }
     }
 
@@ -128,6 +131,7 @@ impl JoinEngine {
             last_anchored_keystone: 0,
             db: None,
             startup_catch_up_done: false,
+            last_state_prune: Utc::now(),
         }
     }
 
@@ -143,7 +147,25 @@ impl JoinEngine {
         Ok(())
     }
 
+    /// Periodically evict completed transfers from in-memory state. Runs on the
+    /// event path (not on keystone events, which never fire on chains where PoP
+    /// payouts are inactive) but is throttled to once per five minutes.
+    fn maybe_prune_state(&mut self) {
+        let now = Utc::now();
+        if now - self.last_state_prune < chrono::Duration::minutes(5) {
+            return;
+        }
+        self.last_state_prune = now;
+        // Terminal transfers linger 1h (reorg replay margin); un-anchored
+        // BTC→Hemi deposits wait 24h for their keystone before eviction.
+        self.state.prune_completed(
+            now - chrono::Duration::hours(1),
+            now - chrono::Duration::hours(24),
+        );
+    }
+
     async fn process(&mut self, event: RawEvent) -> Result<()> {
+        self.maybe_prune_state();
         match &event {
             // Reorgs — handle before matching so we retract before processing new events
             RawEvent::Bitcoin(BitcoinEvent::BlockReorg { affected_from_block, old_tip, new_tip, depth }) => {
@@ -301,7 +323,7 @@ impl JoinEngine {
 
         // Collect transfers whose Hemi mint block is covered by this keystone.
         let to_anchor: Vec<Uuid> = self.state
-            .transfers_initiated_with_hemi_mint()
+            .unanchored_btc_transfers_with_hemi_mint()
             .into_iter()
             .filter(|(_, mint_block)| anchor.covers_block(*mint_block))
             .map(|(id, _)| id)
@@ -309,11 +331,12 @@ impl JoinEngine {
 
         let anchored_at = Utc::now();
 
-        // In-memory fan-out — covers transfers seen in this session.
+        // In-memory fan-out — covers transfers seen in this session. Status is NOT
+        // changed: BTC→Hemi deposits are already FINALIZED at mint time and PoP
+        // anchoring is tracked by the pop_* fields alone.
         let mut anchored_in_memory: std::collections::HashSet<uuid::Uuid> =
             std::collections::HashSet::with_capacity(to_anchor.len());
         for id in to_anchor {
-            self.state.anchor(&id).map_err(|e| StraitError::Internal(e.to_string()))?;
             self.state.set_pop_anchor(&id, keystone_block, pop_score, anchored_at);
 
             self.emit(TunnelTransferUpdate::PopAnchored {
@@ -488,23 +511,33 @@ impl JoinEngine {
     ) -> Result<()> {
         warn!(chain = %chain, affected_from_block, "Reorg — retracting affected transfers");
 
-        self.state.handle_reorg(&chain, affected_from_block, reorg_event);
-
-        // Emit retraction for any transfer now marked REORGED
-        let retracted: Vec<Uuid> = self.state
-            .transfers_by_status_discriminant(std::mem::discriminant(
-                &TunnelStatus::Reorged { retracted_at: Utc::now() }
-            ))
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-
+        // In-memory retraction — transfers seen this session.
+        let retracted = self.state.handle_reorg(&chain, affected_from_block, reorg_event);
         for id in retracted {
             self.emit(TunnelTransferUpdate::Retracted {
                 id,
                 reason: format!("Reorg on {chain} from block {affected_from_block}"),
                 retracted_at: Utc::now(),
             }).await?;
+        }
+
+        // DB-wide retraction — covers transfers persisted in prior sessions that
+        // are no longer in memory. Rows revive automatically if their events are
+        // re-observed when the ingester re-scans the canonical chain.
+        if let Some(ref db) = self.db {
+            let repo = TunnelTransferRepo::new(db);
+            match repo.mark_reorged(&chain.to_string(), affected_from_block as i64).await {
+                Ok(ids) if !ids.is_empty() => {
+                    warn!(
+                        chain = %chain,
+                        affected_from_block,
+                        count = ids.len(),
+                        "Marked persisted transfers REORGED — they revive if re-observed on the canonical chain"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "DB reorg retraction failed"),
+            }
         }
 
         Ok(())
@@ -995,8 +1028,9 @@ mod tests {
         let (update_tx, mut update_rx) = tokio::sync::mpsc::channel(32);
         let handle = tokio::spawn(JoinEngine::new_for_test(event_rx, update_tx).run());
 
-        // 1. A BTC→Hemi mint at the real testnet block → engine emits Created (INITIATED).
-        //    PoP anchoring applies to BTC routes (ETH routes finalize immediately).
+        // 1. A BTC→Hemi mint at the real testnet block → engine emits Created.
+        //    The mint confirms the user has their hBTC, so the transfer is
+        //    FINALIZED immediately; PoP anchoring is tracked separately.
         event_tx
             .send(RawEvent::Hemi(HemiEvent::TunnelMint {
                 tx_hash: TxHash::from_hex(REAL_TX).unwrap(),
@@ -1014,13 +1048,16 @@ mod tests {
         let id = match update_rx.recv().await.unwrap() {
             TunnelTransferUpdate::Created(t) => {
                 assert_eq!(t.route, TunnelRoute::BtcToHemi);
-                assert!(matches!(t.status, TunnelStatus::Initiated));
+                assert!(matches!(t.status, TunnelStatus::Finalized));
+                assert!(t.finalized_at.is_some());
+                assert!(!t.pop_anchored);
                 t.id
             }
             other => panic!("expected Created, got {other:?}"),
         };
 
         // 2. The keystone covering block 6037628 fires → PoP anchored on Bitcoin.
+        //    Status stays FINALIZED; only the pop_* fields are recorded.
         event_tx
             .send(RawEvent::Hemi(HemiEvent::PopKeystoneAnchored {
                 hemi_tx_hash: TxHash([0u8; 32]),
@@ -1041,16 +1078,14 @@ mod tests {
             }
             other => panic!("expected PopAnchored, got {other:?}"),
         }
-        match update_rx.recv().await.unwrap() {
-            TunnelTransferUpdate::StatusChanged { id: sid, new_status, .. } => {
-                assert_eq!(sid, id);
-                assert!(matches!(new_status, TunnelStatus::Anchored));
-            }
-            other => panic!("expected StatusChanged, got {other:?}"),
-        }
 
+        // No status change follows — FINALIZED is already terminal for this route.
         drop(event_tx);
         let _ = handle.await;
+        assert!(matches!(
+            update_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test]

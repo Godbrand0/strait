@@ -19,11 +19,15 @@ pub struct AppConfig {
 /// Bitcoin chain configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct BitcoinConfig {
-    /// Bitcoin RPC URL (e.g., http://localhost:8332)
+    /// Bitcoin RPC URL. Legacy/optional: all Bitcoin state is currently read
+    /// through the BitcoinKit precompile on Hemi, so no Bitcoin node is needed.
+    #[serde(default)]
     pub rpc_url: String,
-    /// Bitcoin RPC username
+    /// Bitcoin RPC username (legacy/optional, see `rpc_url`).
+    #[serde(default)]
     pub rpc_user: String,
-    /// Bitcoin RPC password
+    /// Bitcoin RPC password (legacy/optional, see `rpc_url`).
+    #[serde(default)]
     pub rpc_password: String,
     /// Comma-separated list of tunnel custody addresses to watch
     pub tunnel_addresses: Vec<String>,
@@ -303,23 +307,11 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Validate that all required configuration is present
+    /// Validate that all required configuration is present.
+    ///
+    /// The Bitcoin RPC credentials are deliberately NOT required: all Bitcoin
+    /// state is read through the BitcoinKit precompile on Hemi.
     fn validate(&self) -> Result<()> {
-        if self.bitcoin.rpc_url.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_URL is required".to_string(),
-            ));
-        }
-        if self.bitcoin.rpc_user.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_USER is required".to_string(),
-            ));
-        }
-        if self.bitcoin.rpc_password.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_PASSWORD is required".to_string(),
-            ));
-        }
         if self.hemi.rpc_url.is_empty() {
             return Err(StraitError::MissingConfig(
                 "HEMI_RPC_URL is required".to_string(),
@@ -372,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let config = AppConfig {
+        let mut config = AppConfig {
             bitcoin: BitcoinConfig {
                 rpc_url: String::new(),
                 rpc_user: "user".to_string(),
@@ -381,6 +373,8 @@ mod tests {
                 confirmation_depth: 6,
                 poll_interval_secs: 10,
                 bitcoin_kit_rpc_url: None,
+                payout_kit_rpc_url: None,
+                vault_contracts: vec![],
             },
             hemi: EvmChainConfig {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
@@ -418,7 +412,12 @@ mod tests {
             },
         };
 
-        // Should fail because bitcoin.rpc_url is empty
+        // Bitcoin RPC credentials are legacy/optional — everything is read via
+        // BitcoinKit on Hemi — so an empty bitcoin.rpc_url must NOT fail.
+        assert!(config.validate().is_ok());
+
+        // A missing Hemi RPC URL is a hard error.
+        config.hemi.rpc_url = String::new();
         assert!(config.validate().is_err());
     }
 }

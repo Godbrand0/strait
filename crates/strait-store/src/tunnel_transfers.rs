@@ -92,8 +92,11 @@ impl<'a> TunnelTransferRepo<'a> {
             )
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             ON CONFLICT (id) DO UPDATE SET
-                -- Never let a late INITIATED event regress an advanced status.
+                -- Never let a late INITIATED event regress an advanced status —
+                -- except a REORGED row, which a re-observed event revives (the
+                -- event re-confirmed on the canonical chain after the reorg).
                 status             = CASE WHEN EXCLUDED.status = 'INITIATED'
+                                           AND tunnel_transfers.status <> 'REORGED'
                                           THEN tunnel_transfers.status ELSE EXCLUDED.status END,
                 asset              = EXCLUDED.asset,
                 direction          = EXCLUDED.direction,
@@ -454,6 +457,29 @@ impl<'a> TunnelTransferRepo<'a> {
         .await
         .map_err(StraitError::Database)?;
         Ok(())
+    }
+
+    /// Mark every transfer whose source or destination leg sits at or above
+    /// `from_block` on `chain` as REORGED. Returns the affected ids.
+    ///
+    /// Called by the join engine when an ingester reports a reorg. Rows revive
+    /// automatically if their events are re-observed on the canonical chain:
+    /// the upsert lets a re-delivered event overwrite REORGED.
+    pub async fn mark_reorged(&self, chain: &str, from_block: i64) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query_as::<_, (Uuid,)>(
+            "UPDATE tunnel_transfers
+             SET status = 'REORGED', updated_at = NOW()
+             WHERE status <> 'REORGED'
+               AND ((source_chain = $1 AND source_block >= $2)
+                 OR (dest_chain  = $1 AND dest_block  >= $2))
+             RETURNING id",
+        )
+        .bind(chain)
+        .bind(from_block)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// List transfers, most recent first.
