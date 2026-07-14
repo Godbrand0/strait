@@ -33,6 +33,7 @@ function Nav() {
           <a href="#why-better" className="hover:text-white transition-colors">Why Strait</a>
           <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
           <a href="/docs" className="hover:text-white transition-colors">Docs</a>
+          <a href="/webhooks" className="hover:text-white transition-colors">Webhooks</a>
           <a href="#roadmap" className="hover:text-white transition-colors">Roadmap</a>
         </div>
         <div className="flex items-center gap-3">
