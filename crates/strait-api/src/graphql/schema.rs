@@ -108,11 +108,20 @@ pub struct Stats {
 }
 
 /// How far back an analytics query looks.
+///
+/// Explicit `name`s: async-graphql's default SCREAMING_SNAKE_CASE conversion
+/// treats a letter-to-digit boundary as a new word, mangling `Last24h`/`Last30d`
+/// into `LAST_2_4H`/`LAST_3_0D` — confirmed via introspection against the live
+/// schema. Pin the wire names explicitly instead of relying on the derive.
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
 pub enum TimeWindow {
+    #[graphql(name = "LAST_24H")]
     Last24h,
+    #[graphql(name = "LAST_7D")]
     Last7d,
+    #[graphql(name = "LAST_30D")]
     Last30d,
+    #[graphql(name = "ALL_TIME")]
     AllTime,
 }
 
@@ -254,14 +263,17 @@ impl Query {
         Ok(rows.into_iter().map(Transfer::from).collect())
     }
 
-    /// Aggregate indexer statistics.
-    async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<Stats> {
+    /// Aggregate indexer statistics. `window` defaults to all-time (omit it to
+    /// preserve the original unwindowed behavior); pass it to scope every count
+    /// to the same window used for `analyticsSeries`/`routeBreakdown`.
+    async fn stats(&self, ctx: &Context<'_>, window: Option<TimeWindow>) -> async_graphql::Result<Stats> {
         let db = db(ctx)?;
         let repo = TunnelTransferRepo::new(db);
+        let since = window.unwrap_or(TimeWindow::AllTime).since();
         let (total, by_status, pop) = tokio::try_join!(
-            repo.count(),
-            repo.count_by_status(),
-            repo.count_pop_anchored(),
+            repo.count(since),
+            repo.count_by_status(since),
+            repo.count_pop_anchored(since),
         )
         .map_err(to_gql)?;
         let n = |s: &str| *by_status.get(s).unwrap_or(&0);
